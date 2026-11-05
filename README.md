@@ -4,7 +4,9 @@ PageAtlas captures a website or browser-based app and turns it into a design rev
 
 ## Run on Windows
 
-Install Node.js 22.18 or newer and use an installed copy of Microsoft Edge or Google Chrome. Open PowerShell in this folder and run the following commands.
+Install Node.js 22.18 or newer and use an installed copy of Microsoft Edge or Google Chrome. Double-click **Start PageAtlas.bat** in the project folder. It installs missing dependencies, prepares the latest build, starts PageAtlas, and opens your browser when the app is ready. Keep the launcher window open while using PageAtlas. Running the launcher again opens an already running copy.
+
+To start it from PowerShell, open this folder and run the following commands.
 
 ```powershell
 npm.cmd ci
