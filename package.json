@@ -1,0 +1,31 @@
+{
+  "name": "pageatlas",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "dev": "node --watch server/index.ts --dev",
+    "check": "tsc --noEmit",
+    "build": "npm run check && vite build",
+    "start": "node server/index.ts"
+  },
+  "dependencies": {
+    "lucide-react": "^1.68.0",
+    "playwright-core": "^1.64.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.4",
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "tailwindcss": "^4.3.4",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}
