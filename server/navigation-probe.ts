@@ -7,29 +7,34 @@ export type NavigationProbeResult = {
   changed: boolean;
   popupUrl?: string;
   blocked: boolean;
+  clicked: boolean;
+  reason?: string;
 };
 
 export async function probeNavigation(page: Page, target: NavigationTarget): Promise<NavigationProbeResult> {
   const beforeUrl = page.url();
-  if (!target.control || page.isClosed()) return { url: beforeUrl, changed: false, blocked: true };
-  const deadline = Date.now() + 2000;
+  if (!target.control || page.isClosed()) return { url: beforeUrl, changed: false, blocked: true, clicked: false, reason: 'The navigation control is no longer available.' };
+  const deadline = Date.now() + 6000;
   const control = page.locator(target.control.selector);
   if (await control.count() !== 1 || !await control.isVisible()) {
-    return { url: beforeUrl, changed: false, blocked: true };
+    return { url: beforeUrl, changed: false, blocked: true, clicked: false, reason: 'The navigation control was hidden or could not be identified uniquely.' };
   }
-  const eligible = await control.evaluate((element, expectedLabel) => {
-    if (element.closest('form, [inert]') || element.matches('[disabled], [aria-disabled=true]')) return false;
+  const ineligibleReason = await control.evaluate((element, expectedLabel) => {
+    if (element.closest('form, [inert]') || element.matches('[form], [type=submit], [type=reset]')) return 'The control belongs to a form or an inactive view.';
+    if (element.matches('[disabled], [aria-disabled=true]')) return 'The navigation control was disabled.';
     const referenced = element.getAttribute('aria-labelledby')?.split(/\s+/)
       .map(id => document.getElementById(id)?.textContent || '').join(' ');
     const label = [element.getAttribute('aria-label'), referenced, element.textContent,
       element instanceof HTMLInputElement ? element.value : undefined, element.getAttribute('title')]
       .map(value => value?.trim().replace(/\s+/g, ' ')).find(Boolean)?.slice(0, 140);
-    if (label !== expectedLabel) return false;
+    const withoutBadge = (value: string) => value.trim().replace(/\s*(?:\(\s*\d+\s*\)|\[\s*\d+\s*\])\s*$/, '').trim();
+    if (!label || withoutBadge(label) !== withoutBadge(expectedLabel)) return 'The navigation control changed before it could be clicked.';
     const role = element.getAttribute('role');
-    return element instanceof HTMLButtonElement || (element instanceof HTMLInputElement && element.type === 'button') ||
+    const eligible = element instanceof HTMLButtonElement || (element instanceof HTMLInputElement && element.type === 'button') ||
       role === 'link' || role === 'tab' || role === 'button' || role === 'menuitem';
-  }, target.label, { timeout: Math.max(1, deadline - Date.now()) }).catch(() => false);
-  if (!eligible) return { url: beforeUrl, changed: false, blocked: true };
+    return eligible ? undefined : 'The element was no longer an interactive navigation control.';
+  }, target.label, { timeout: Math.max(1, deadline - Date.now()) }).catch(() => 'The navigation control could not be inspected.');
+  if (ineligibleReason) return { url: beforeUrl, changed: false, blocked: true, clicked: false, reason: ineligibleReason };
 
   const state = await page.evaluateHandle(() => {
     let blocked = false;
@@ -69,17 +74,32 @@ export async function probeNavigation(page: Page, target: NavigationTarget): Pro
       };
       const roots = Array.from(document.querySelectorAll<HTMLElement>('main, [role=main], dialog[open], [role=dialog], [role=menu]'))
         .filter(visible);
+      const text = (value: string | null | undefined, limit: number) => value?.replace(/\s+/g, ' ').trim().slice(0, limit).replace(/\d+/g, '#');
       const content = (roots.length ? roots : [document.body]).filter(Boolean)
-        .map(element => element.innerText.replace(/\s+/g, ' ').trim().slice(0, 4000).replace(/\d/g, '#'));
+        .map(element => text(element.innerText, 4000));
       const controls = Array.from(document.querySelectorAll('[role=tab], [aria-expanded], dialog, [role=dialog]'))
         .filter(visible).slice(0, 100).map(element => [
-          element.getAttribute('aria-label') || element.textContent?.trim().slice(0, 120),
+          text(element.getAttribute('aria-label') || element.textContent, 120),
           element.getAttribute('aria-selected'), element.getAttribute('aria-expanded'),
-          element.hasAttribute('open'), element.getAttribute('aria-busy'),
+          element.hasAttribute('open'),
         ]);
       const links = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))
-        .filter(visible).slice(0, 150).map(link => [link.href, link.textContent?.trim().slice(0, 100)]);
-      return JSON.stringify([document.title, content, controls, links]);
+        .filter(visible).slice(0, 150).map(link => [link.href, text(link.textContent, 100)]);
+      return JSON.stringify([text(document.title, 200), content, controls, links]);
+    }
+    function loading() {
+      if (document.readyState === 'loading') return true;
+      const main = document.querySelector<HTMLElement>('main, [role=main]') ?? document.body;
+      const content = main?.innerText.trim() || '';
+      if (content.length < 150 && /^(?:loading(?:\b|[.…])|fetching\b|please\s+wait\b)/i.test(content)) return true;
+      return Array.from(document.querySelectorAll('[aria-busy=true], [data-loading=true], [data-state=loading], [class*="skeleton" i], [role=status]'))
+        .slice(0, 1000).some(element => {
+          const bounds = element.getBoundingClientRect();
+          if (!element.checkVisibility({ visibilityProperty: true }) || bounds.width <= 0 || bounds.height <= 0 ||
+              bounds.top >= innerHeight || bounds.bottom <= 0 || bounds.left >= innerWidth || bounds.right <= 0) return false;
+          if (element.matches('[aria-busy=true], [data-loading=true], [data-state=loading], [class*="skeleton" i]')) return true;
+          return /^\s*(?:loading(?:\b|[.…])|fetching\b|please\s+wait\b)/i.test(element.getAttribute('aria-label') || element.textContent || '');
+        });
     }
     let installed = false;
     try {
@@ -93,7 +113,7 @@ export async function probeNavigation(page: Page, target: NavigationTarget): Pro
     return {
       installed,
       before: signature(),
-      inspect() { return { popupUrl, blocked, signature: signature() }; },
+      inspect() { return { popupUrl, blocked, signature: signature(), loading: loading() }; },
       restore,
     };
   });
@@ -102,12 +122,15 @@ export async function probeNavigation(page: Page, target: NavigationTarget): Pro
   let blocked = false;
   let contentChanged = false;
   let clicked = false;
+  let stillLoading = false;
+  let stableSince = Date.now();
+  let lastSignature = '';
   try {
     const installed = await state.evaluate(value => value.installed);
-    if (!installed) return { url: beforeUrl, changed: false, blocked: true };
+    if (!installed) return { url: beforeUrl, changed: false, blocked: true, clicked: false, reason: 'The navigation control could not be explored with the interaction guards.' };
     const before = await state.evaluate(value => value.before);
     try {
-      await control.click({ timeout: Math.max(1, Math.min(1200, deadline - Date.now())), noWaitAfter: true });
+      await control.click({ timeout: Math.max(1, Math.min(3000, deadline - Date.now())), noWaitAfter: true });
       clicked = true;
     } catch {
       // Navigation may replace the control before Playwright completes its actionability check.
@@ -115,16 +138,26 @@ export async function probeNavigation(page: Page, target: NavigationTarget): Pro
     while (!page.isClosed() && Date.now() < deadline) {
       await delay(Math.min(100, Math.max(1, deadline - Date.now())));
       const observed = await state.evaluate(value => value.inspect()).catch(() => undefined);
-      if (observed) {
-        popupUrl = observed.popupUrl;
-        blocked ||= observed.blocked;
-        contentChanged = observed.signature !== before;
+      if (!observed) {
+        if (page.url() !== beforeUrl) break;
+        continue;
       }
-      if (page.url() !== beforeUrl || popupUrl || contentChanged || blocked) break;
+      popupUrl = observed.popupUrl;
+      blocked ||= observed.blocked;
+      stillLoading = observed.loading;
+      contentChanged = observed.signature !== before;
+      if (observed.signature !== lastSignature || stillLoading) stableSince = Date.now();
+      lastSignature = observed.signature;
+      if (page.url() !== beforeUrl || popupUrl || blocked) break;
+      if (contentChanged && !stillLoading && Date.now() - stableSince >= 350) break;
     }
     const url = page.url();
-    const changed = url !== beforeUrl || Boolean(popupUrl) || contentChanged;
-    return { url, changed, ...(popupUrl && { popupUrl }), blocked: blocked || (!clicked && !changed) };
+    const changed = url !== beforeUrl || Boolean(popupUrl) || (contentChanged && !stillLoading);
+    const reason = blocked ? 'The control attempted an unsupported window or data-changing interaction.'
+      : !clicked && !changed ? 'The navigation control could not be clicked.'
+        : !changed && stillLoading ? 'The control was still loading after it was clicked.'
+          : !changed ? 'The control did not open another view within the interaction allowance.' : undefined;
+    return { url, changed, ...(popupUrl && { popupUrl }), blocked: blocked || (!clicked && !changed), clicked, ...(reason && { reason }) };
   } finally {
     await state.evaluate(value => value.restore()).catch(() => {});
     await state.dispose().catch(() => {});

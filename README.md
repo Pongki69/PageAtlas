@@ -17,11 +17,11 @@ Open [PageAtlas](http://127.0.0.1:4317) and leave the PowerShell window open whi
 ## Capture and export
 
 1. Paste a public HTTP or HTTPS URL, or use the URL printed by a dev server running on this computer. PageAtlas accepts `localhost` and IP addresses assigned to this computer. For an HTTPS dev server you recognize, select **Allow local development certificate** or choose **Allow local certificate and retry** if a certificate error appears.
-2. Choose Desktop (1440 × 900), Tablet (768 × 1024), or Mobile (390 × 844). Turn on **Capture linked pages** to include the app's navigation, then start the capture.
+2. Choose Desktop (1440 × 900), Tablet (768 × 1024), or Mobile (390 × 844). **Capture linked pages** starts enabled for exploring the app. Turn it off for a single-page capture.
 3. Use **Captured page** to switch screens. In Mobile mode, choose **Scroll view** to inspect each viewport and its structure map. Desktop and tablet captures include separate independently scrolling areas.
 4. Export the review to one `.html` file. Multi-page exports include a page index and work offline.
 
-Linked-page mode uses browser HTML and accessibility semantics to discover navigation across frameworks. It follows links, button-styled links, explicit route attributes, and bounded view queries. It also explores recognizable navigation buttons, tabs, and menu disclosures, including views that change without a new URL. It captures up to 30 views within its time and image-size limits and attempts up to 24 navigation controls. The review reports skipped controls and limit warnings. Coverage depends on the controls the site exposes and the pages accessible to the current account.
+Linked-page mode uses browser HTML and accessibility semantics to discover navigation across frameworks. It follows links, button-styled links, explicit route attributes, and bounded scalar URL queries. It also clicks visible non-action buttons, tabs, and menu disclosures, including controls with plain labels and views that change without a new URL. It preserves the page reached by a JavaScript click and replays preceding navigation steps when needed. It captures up to 30 views within its time and image-size limits and attempts up to 48 navigation controls. The review shows discovered controls, actual click counts, and labeled reasons for skipped controls. Coverage depends on the controls the site exposes and the pages accessible to the current account.
 
 During control exploration, PageAtlas blocks data-changing HTTP requests and intercepts new windows. Forms and controls that appear to save, delete, pay, or submit are excluded from exploration. Apps that need an unsupported interaction or a write request to reveal a screen can produce a skipped-control notice.
 

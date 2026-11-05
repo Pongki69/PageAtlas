@@ -630,6 +630,25 @@ button:not(:disabled), label:has(input:not(:disabled)) {
   font-weight: 700;
 }
 
+.exploration-skips {
+  flex: 1 1 100%;
+}
+
+.exploration-skipped-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  color: var(--muted);
+  font-size: .8rem;
+  overflow-wrap: anywhere;
+}
+
+.exploration-skipped-list strong {
+  color: var(--text);
+}
+
 .page-picker-field {
   min-width: 0;
   max-width: 380px;

@@ -60,6 +60,13 @@ export type CaptureResult = {
   scrollRegions: ScrollRegion[];
   warnings: string[];
   linkedPages?: CaptureResult[];
+  exploration?: {
+    linksFound: number;
+    controlsFound: number;
+    controlsClicked: number;
+    viewsCaptured: number;
+    skipped: { label: string; reason: string }[];
+  };
 };
 
 export type InteractiveCapture = {
@@ -90,9 +97,9 @@ const CAPTURE_TIMEOUT = 60000;
 const CRAWL_TIMEOUT = 180000;
 const CRAWL_PAGE_LIMIT = 30;
 const CRAWL_DEPTH_LIMIT = 3;
-const CRAWL_ATTEMPT_LIMIT = 45;
+const CRAWL_ATTEMPT_LIMIT = 90;
 const CRAWL_LINK_LIMIT = 240;
-const CRAWL_CONTROL_LIMIT = 24;
+const CRAWL_CONTROL_LIMIT = 48;
 const CRAWL_IMAGE_BYTES = 48 * 1024 * 1024;
 const SECTION_LIMIT = 180;
 const SCROLL_REGION_LIMIT = 6;
@@ -1207,6 +1214,17 @@ function captureSize(result: CaptureResult) {
     .reduce((size, data) => size + Buffer.byteLength(data.slice(PNG_PREFIX.length), "base64"), 0);
 }
 
+async function returnToSource(page: Page, sourceUrl: string, origin: string, timeout: number) {
+  if (crawlRoute(page.url(), origin) === sourceUrl) return;
+  for (let index = 0; index < 6; index++) {
+    const before = page.url();
+    await page.goBack({ waitUntil: 'domcontentloaded', timeout: Math.min(2500, timeout) }).catch(() => null);
+    if (crawlRoute(page.url(), origin) === sourceUrl) return;
+    if (page.url() === before) break;
+  }
+  await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout });
+}
+
 async function captureLinkedPages(page: Page, session: CaptureBrowser, root: CaptureResult, expiresAt: number, interactive: boolean) {
   const linkedPages: CaptureResult[] = [];
   const origin = new URL(root.url).origin;
@@ -1214,10 +1232,9 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
   if (entry.origin !== origin) {
     return { ...root, linkedPages, warnings: [...root.warnings, "The app changed origins during capture. No linked pages were followed."] };
   }
-  entry.search = "";
   const seen = new Set<string>();
   const scheduled = new Set<string>();
-  const queue: (NavigationTarget & { depth: number; steps: NavigationTarget[] })[] = [];
+  const queue: (NavigationTarget & { depth: number; steps: NavigationTarget[]; entryUrl: string })[] = [];
   const entryRoute = crawlRoute(entry.href, origin);
   if (entryRoute) {
     seen.add(entryRoute);
@@ -1227,6 +1244,7 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
   let attempts = 0;
   let controlsTried = 0;
   let controlsSkipped = 0;
+  const exploration = { linksFound: 0, controlsFound: 0, controlsClicked: 0, viewsCaptured: 1, skipped: [] as { label: string; reason: string }[] };
   let probing = false;
   let blockedProbeRequest = false;
   let skipped = 0;
@@ -1234,17 +1252,32 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
   let limited = false;
   let stopped = false;
 
-  async function discover(depth: number, steps: NavigationTarget[] = []) {
+  function skipControl(label: string, reason: string) {
+    controlsSkipped++;
+    exploration.skipped.push({ label, reason });
+  }
+
+  async function discover(depth: number, steps: NavigationTarget[] = [], entryUrl = page.url()) {
     for (const link of await discoverNavigation(page)) {
       const url = crawlRoute(link.url, origin);
-      const key = link.control ? `${url}|${link.key}` : url;
-      if (!url || !key || scheduled.has(key) || seen.has(key)) continue;
+      if (!url) {
+        if (link.control) skipControl(link.label, 'The source address could not be replayed within this app.');
+        continue;
+      }
+      const trail = steps.map(step => {
+        const label = step.label.replace(/\s*[([]\s*\d+\s*[)\]]\s*$/, '').trim();
+        return `${step.control?.selector}:${label}`;
+      }).join('>');
+      const key = link.control ? `${url}|${trail}|${link.key}` : url;
+      if (scheduled.has(key) || seen.has(key)) continue;
       if (depth > CRAWL_DEPTH_LIMIT || scheduled.size >= CRAWL_LINK_LIMIT) {
         limited = true;
         continue;
       }
       scheduled.add(key);
-      queue.push({ ...link, url, key, depth, steps: link.control ? steps : [] });
+      if (link.control) exploration.controlsFound++;
+      else exploration.linksFound++;
+      queue.push({ ...link, url, key, depth, steps: link.control ? steps : [], entryUrl: link.control && steps.length ? entryUrl : url });
     }
     queue.sort((a, b) => a.priority - b.priority || a.depth - b.depth);
   }
@@ -1296,13 +1329,37 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
           if (!link || seen.has(link.key)) continue;
           if (link.control && controlsTried >= CRAWL_CONTROL_LIMIT) {
             limited = true;
+            skipControl(link.label, 'The capture reached its navigation-control limit.');
             continue;
           }
           attempts++;
           try {
             await withinCaptureBudget(async startedAt => {
               probing = false;
-              const response = await page.goto(link.url, { waitUntil: "domcontentloaded", timeout: Math.min(9000, remaining) });
+              const navigationTimeout = Math.min(9000, remaining);
+              let response: Awaited<ReturnType<Page['goto']>> = null;
+              let stepsToReplay = link.steps;
+              if (link.control) {
+                const selector = link.control.selector;
+                const sameSource = crawlRoute(page.url(), origin) === link.url;
+                if (sameSource) {
+                  const obscuredByDialog = await page.evaluate(selector => {
+                    const target = document.querySelector(selector);
+                    return Array.from(document.querySelectorAll('dialog[open], [role=dialog][aria-modal=true]'))
+                      .some(dialog => dialog.checkVisibility({ visibilityProperty: true }) && (!target || !dialog.contains(target)));
+                  }, selector);
+                  if (obscuredByDialog) {
+                    probing = true;
+                    await page.keyboard.press('Escape');
+                  }
+                }
+                const availableHere = sameSource && await page.locator(selector).count() === 1 &&
+                  await page.locator(selector).isVisible();
+                if (availableHere) stepsToReplay = [];
+                else await returnToSource(page, link.entryUrl, origin, navigationTimeout);
+              } else {
+                response = await page.goto(link.url, { waitUntil: "domcontentloaded", timeout: navigationTimeout });
+              }
               let url = crawlRoute(page.url(), origin);
               if (!url || (response && response.status() >= 400)) {
                 skipped++;
@@ -1317,32 +1374,41 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
                 await waitForContent(page, startedAt + CAPTURE_TIMEOUT - 1500, true);
                 blockedProbeRequest = false;
                 probing = true;
-                for (const step of link.steps) {
+                for (const step of stepsToReplay) {
                   const replay = await probeNavigation(page, step);
                   if (replay.blocked || blockedProbeRequest || !replay.changed) {
-                    controlsSkipped++;
+                    skipControl(link.label, replay.reason || 'A preceding navigation step could not be reopened.');
                     return;
                   }
                   await waitForContent(page, startedAt + CAPTURE_TIMEOUT - 1500);
                 }
+                url = crawlRoute(page.url(), origin);
+                if (!url || url !== link.url) {
+                  skipControl(link.label, 'The preceding navigation steps did not restore this screen.');
+                  return;
+                }
                 const outcome = await probeNavigation(page, link);
+                if (outcome.clicked) exploration.controlsClicked++;
                 const destination = crawlRoute(outcome.popupUrl || outcome.url, origin);
                 if (!destination) {
-                  controlsSkipped++;
+                  skipControl(link.label, 'The control opened an address outside the supported app navigation.');
                   return;
                 }
                 if (destination !== url) {
                   probing = false;
-                  const destinationResponse = await page.goto(destination, { waitUntil: 'domcontentloaded', timeout: Math.min(9000, remaining) });
+                  const destinationResponse = outcome.popupUrl
+                    ? await page.goto(destination, { waitUntil: 'domcontentloaded', timeout: navigationTimeout }) : null;
                   url = crawlRoute(page.url(), origin);
                   if (!url || (destinationResponse && destinationResponse.status() >= 400)) {
-                    controlsSkipped++;
+                    skipControl(link.label, 'The destination did not finish opening within this app.');
                     return;
                   }
                   viewKey = url;
+                  nextSteps = outcome.popupUrl ? [] : [...link.steps, link];
                 } else {
                   if (!outcome.changed || outcome.blocked || blockedProbeRequest) {
-                    controlsSkipped++;
+                    skipControl(link.label, outcome.reason || (blockedProbeRequest
+                      ? 'The control required a data-changing request.' : 'The click did not open another screen.'));
                     return;
                   }
                   viewKey = link.key;
@@ -1369,7 +1435,8 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
               }
               bytes += pageBytes;
               linkedPages.push({ ...result, navigationLabel: link.label || undefined });
-              await discover(link.depth + 1, nextSteps);
+              exploration.viewsCaptured = linkedPages.length + 1;
+              await discover(link.depth + 1, nextSteps, nextSteps.length ? link.entryUrl : page.url());
             }, Math.min(CAPTURE_TIMEOUT, remaining));
           } catch (error) {
             if (error instanceof CaptureError && error.code === 'CONTENT_NOT_READY') {
@@ -1380,6 +1447,7 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
               stopped = true;
             } else {
               skipped++;
+              if (link.control) skipControl(link.label, error instanceof CaptureError ? error.message : 'The control could not be explored.');
             }
           } finally {
             probing = false;
@@ -1401,7 +1469,7 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
   for (const label of loadingSkipped) warnings.push(`${label} was still loading and was skipped.`);
   if (controlsSkipped) warnings.push(`${controlsSkipped} navigation controls were skipped because they did not open a supported view or required a blocked action.`);
   if (limited) warnings.push("The linked-page capture reached a safety or size limit. The review contains the pages captured so far.");
-  return { ...root, linkedPages: linkedPages.slice(), warnings };
+  return { ...root, linkedPages: linkedPages.slice(), warnings, exploration };
 }
 
 export async function capturePage(input: CaptureRequest): Promise<CaptureResult> {

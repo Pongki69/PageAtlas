@@ -8,10 +8,9 @@ export type NavigationTarget = {
   control?: { selector: string; kind: "navigate" | "disclosure" | "tab" };
 };
 
-const viewParameters = new Set(["view", "tab", "screen", "page", "section", "mode"]);
 const unsafePath = /(?:^|[/_.-])(?:log[/_.-]?out|sign[/_.-]?out|delete|remove|destroy|cancel|revoke|unsubscribe|submit|checkout|purchase|pay|approve|reject|refund|download|export|impersonate|verify|reset|activate|execute|webhook)(?:$|[/_.-])/i;
 const documentOnlyPath = /(?:^|[/_.-])(?:api|oauth|sso|auth|token|login|sign[/_.-]?in)(?:$|[/_.-])/i;
-const unsafeQuery = /(?:^|[_-])(?:action|delete|remove|destroy|cancel|revoke|unsubscribe|submit|checkout|purchase|pay|approve|reject|refund|execute|download|export|token|secret|password|credential|authorization|auth|code|signature|nonce|redirect|returnurl|callback)(?:$|[_-])/i;
+const unsafeQuery = /(?:^|[_-])(?:action|delete|remove|destroy|cancel|revoke|unsubscribe|submit|checkout|purchase|pay|approve|reject|refund|execute|download|export|token|secret|password|credential|authorization|auth|code|signature|nonce|redirect|returnurl|callback|session(?:id)?|csrf|xsrf|jwt|api[_-]?key)(?:$|[_-])/i;
 const filePath = /\.(?:zip|gz|tar|pdf|csv|xlsx?|docx?|jpe?g|png|svg|webp|mp[34]|exe|json|xml|txt)$/i;
 
 function decoded(value: string): string {
@@ -23,11 +22,18 @@ function decoded(value: string): string {
 function safeViewQuery(query: URLSearchParams): boolean {
   const keys = new Set<string>();
   for (const [key, value] of query) {
-    if (!viewParameters.has(key.toLowerCase()) || keys.has(key.toLowerCase()) || keys.size >= 4 ||
-        !/^[\w .-]{1,64}$/.test(value) || unsafePath.test(value)) return false;
+    const normalizedKey = key.replace(/([a-z\d])([A-Z])/g, "$1_$2").toLowerCase();
+    if (!/^[a-zA-Z][\w.-]{0,63}$/.test(key) || unsafeQuery.test(normalizedKey) ||
+        keys.has(key.toLowerCase()) || keys.size >= 8 || value.length > 128 ||
+        /[\u0000-\u001f\u007f]/.test(value) || !/^[\p{L}\p{N}\p{M} ._~:@,/+-]*$/u.test(value) ||
+        value.includes("://") || value.startsWith("//") || unsafePath.test(value)) return false;
     keys.add(key.toLowerCase());
   }
   return true;
+}
+
+function controlLabelKey(label: string): string {
+  return label.replace(/\s*[([]\s*\d+\s*[)\]]\s*$/, "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 export function isUnsafeActionUrl(value: string): boolean {
@@ -42,7 +48,8 @@ export function isUnsafeActionUrl(value: string): boolean {
     const hashQuery = hashRoute.includes("?") ? hashRoute.slice(hashRoute.indexOf("?") + 1) : "";
     for (const query of [url.searchParams, new URLSearchParams(hashQuery)]) {
       for (const [key, parameter] of query) {
-        if (unsafeQuery.test(decoded(key)) || unsafePath.test(decoded(parameter))) return true;
+        const normalizedKey = decoded(key).replace(/([a-z\d])([A-Z])/g, "$1_$2").toLowerCase();
+        if (unsafeQuery.test(normalizedKey) || unsafePath.test(decoded(parameter))) return true;
       }
     }
     return false;
@@ -91,7 +98,6 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
     const results: Candidate[] = [];
     const navigationContext = "aside, nav, [role=navigation], [role=complementary], [role=menu], [role=menubar], [role=tablist]";
     const unsafeLabel = /\b(?:delete|remove|destroy|save|submit|send|confirm|checkout|purchase|buy|pay|approve|reject|refund|revoke|unsubscribe|sign\s*out|log\s*out|logout|discard|reset|cancel|download|export|print)\b/i;
-    const clearNavigation = /^(?:open|view|go\s+to|browse|details)(?:\b|\s)/i;
     function labelOf(element: Element) {
       const referenced = element.getAttribute("aria-labelledby")?.split(/\s+/)
         .map(id => document.getElementById(id)?.textContent || "").join(" ");
@@ -156,7 +162,9 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
       }
       if (!visible || !label || unsafeLabel.test(label) || /^(?:close|dismiss|collapse)\b/i.test(label)) continue;
       const role = element.getAttribute("role");
-      if (!["tab", "link", "menuitem"].includes(role || "") && !inNavigation && !clearNavigation.test(label)) continue;
+      const nativeButton = element instanceof HTMLButtonElement ||
+        (element instanceof HTMLInputElement && element.type === "button");
+      if (!nativeButton && !["button", "tab", "link", "menuitem"].includes(role || "") && !inNavigation) continue;
       const selector = selectorOf(element);
       if (!selector || selector.length > 4096) continue;
       const kind = role === "tab" ? "tab"
@@ -169,7 +177,7 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
   const targets = new Map<string, NavigationTarget>();
   for (const candidate of candidates) {
     if (candidate.control) {
-      const key = `control:${candidate.control.kind}:${candidate.control.selector}`;
+      const key = `control:${candidate.control.kind}:${candidate.control.selector}:${controlLabelKey(candidate.label)}`;
       targets.set(key, { ...candidate, url: sourceUrl, key });
       continue;
     }

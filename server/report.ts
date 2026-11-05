@@ -242,6 +242,11 @@ function renderPage(review: CaptureResult, pageNumber?: number): string {
         <div><dt>Mapped elements</dt><dd>${mappedElements}</dd></div>
         <div><dt>Captured</dt><dd><time datetime="${escapeHtml(review.capturedAt)}">${escapeHtml(captureTime)}</time></dd></div>
       </dl>
+      ${review.exploration ? `<p class="source">Navigation exploration found ${review.exploration.linksFound} links and ${review.exploration.controlsFound} controls. Clicked ${review.exploration.controlsClicked} controls and captured ${review.exploration.viewsCaptured} views.</p>
+      ${review.exploration.skipped.length ? `<details class="card scroll-area">
+        <summary>Skipped navigation controls (${review.exploration.skipped.length})</summary>
+        <ul class="source">${review.exploration.skipped.map(item => `<li><strong>${escapeHtml(item.label)}</strong> ${escapeHtml(item.reason)}</li>`).join('')}</ul>
+      </details>` : ''}` : ''}
       ${scrollAreas ? `<a class="scroll-area-jump" href="#${id('scroll-areas')}">View independently scrolling areas ↓</a>` : ''}
       ${warnings ? `<aside class="warnings" aria-label="Capture notes"><p>Capture notes</p><ul>${warnings}</ul></aside>` : ''}
     </header>

@@ -88,6 +88,13 @@ interface PageReview {
 
 interface Review extends PageReview {
   linkedPages?: PageReview[]
+  exploration?: {
+    linksFound: number
+    controlsFound: number
+    controlsClicked: number
+    viewsCaptured: number
+    skipped: { label: string; reason: string }[]
+  }
 }
 
 function initialTheme(): Theme {
@@ -276,12 +283,43 @@ function ViewportReference({ capture, pageName }: { capture: Screenshot; pageNam
   )
 }
 
+function ExplorationSummary({ exploration }: { exploration: NonNullable<Review['exploration']> }) {
+  return (
+    <div className="page-picker exploration-summary" aria-label="Navigation exploration results">
+      <div className="page-picker-copy">
+        <p className="page-picker-count">
+          {exploration.controlsClicked.toLocaleString()} controls clicked · {exploration.viewsCaptured.toLocaleString()} views captured
+        </p>
+        <p>{exploration.linksFound.toLocaleString()} links discovered · {exploration.controlsFound.toLocaleString()} controls discovered</p>
+      </div>
+      {exploration.skipped.length > 0 && (
+        <details className="scroll-area exploration-skips">
+          <summary>
+            <span className="scroll-area-label">Skipped controls ({exploration.skipped.length.toLocaleString()})</span>
+            <ChevronRight className="scroll-area-chevron" size={17} aria-hidden="true" />
+          </summary>
+          <div className="scroll-area-content">
+            <ul className="exploration-skipped-list">
+              {exploration.skipped.map((control, index) => (
+                <li key={`${index}-${control.label}`}>
+                  <strong>{control.label || 'Unnamed control'}</strong>
+                  <p>{control.reason}</p>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </details>
+      )}
+    </div>
+  )
+}
+
 export default function App() {
   const [theme, setTheme] = useState(initialTheme)
   const [url, setUrl] = useState('')
   const [allowDevCertificate, setAllowDevCertificate] = useState(false)
   const [viewport, setViewport] = useState<Viewport>('desktop')
-  const [crawl, setCrawl] = useState(false)
+  const [crawl, setCrawl] = useState(true)
   const [sessionId, setSessionId] = useState(rememberedSession)
   const [signIn, setSignIn] = useState(sessionId !== null)
   const [review, setReview] = useState<Review | null>(null)
@@ -313,7 +351,7 @@ export default function App() {
   const selectedSection = previewSections.find((section) => section.id === selected)
   const scrollRegions = currentPage?.scrollRegions ?? []
   const progress = activity && (crawl && (activity === 'capture' || activity === 'capture-signed-in')
-    ? 'Loading linked pages and capturing their content…'
+    ? 'Clicking navigation controls and capturing app screens…'
     : activityLabels[activity])
 
   useEffect(() => {
@@ -583,7 +621,7 @@ export default function App() {
                   }} />
                   <span>Capture linked pages</span>
                 </label>
-                <p id="linked-pages-help">Explore links, navigation buttons, tabs, and menus within this app. Up to 30 views can take a few minutes.</p>
+                <p id="linked-pages-help">Click navigation buttons and explore links, tabs, and menus. Up to 30 views can take a few minutes.</p>
               </div>
               <div className="capture-option">
                 <label>
@@ -654,6 +692,8 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {review?.exploration && <ExplorationSummary exploration={review.exploration} />}
 
           {review?.linkedPages && currentPage && (
             <div className="page-picker">
