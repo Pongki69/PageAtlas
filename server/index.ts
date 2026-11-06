@@ -298,7 +298,12 @@ expirationTimer.unref();
 
 function requireSameOrigin(req: IncomingMessage): void {
   const origin = req.headers.origin;
-  if ((origin && (hosted ? !allowedOrigins.has(origin) : origin !== `http://${req.headers.host}`))
+  if (hosted && origin && !allowedOrigins.has(origin)) {
+    // Name the address so whoever runs the server can see exactly what to add to the allowed list.
+    console.warn(`PageAtlas refused a request from ${origin}. Allowed: ${[...allowedOrigins].join(', ')}`);
+    throw new CaptureError(403, `This capture server doesn’t accept captures from ${origin}. Add ${origin} to PAGEATLAS_ALLOWED_ORIGINS on the server.`);
+  }
+  if ((origin && !hosted && origin !== `http://${req.headers.host}`)
     || (req.headers['sec-fetch-site'] && !['same-origin', 'none'].includes(req.headers['sec-fetch-site']))) {
     throw new CaptureError(403, 'Start the capture from PageAtlas.');
   }
