@@ -1,22 +1,74 @@
-# PageAtlas
+<p align="center">
+  <img src="public/favicon.svg" width="88" height="88" alt="PageAtlas logo">
+</p>
 
-PageAtlas captures a website or browser-based app and turns it into a design review. Mobile reviews contain individual viewport screenshots taken while scrolling each page. Desktop and tablet reviews use full-page screenshots. Export the review as one HTML file that opens offline in a browser.
+<h1 align="center">PageAtlas</h1>
 
-## Run on Windows
+<p align="center">Capture a website or web app and turn it into a visual design review.</p>
 
-Install Node.js 22.18 or newer and use an installed copy of Microsoft Edge or Google Chrome. Double-click **Start PageAtlas.bat** in the project folder. Its menu offers **1. Start / open**, **2. Restart server with the latest changes**, **3. Stop server**, and **4. Close this menu**. Only one launcher menu stays open per project and port; double-clicking again opens the existing app. Start installs missing dependencies, prepares the latest build, and opens your browser when PageAtlas is ready. The server runs as one hidden Node process without opening another command window. Restart stops the current server, rebuilds, and opens the updated app. Closing the menu leaves PageAtlas running; reopen the batch file whenever you want to stop or restart it. Stop and restart clear in-memory captures and reviews, so export anything you want to keep first.
+<p align="center">
+  <img src="src/assets/review-preview-dark.png" width="760" alt="A PageAtlas review with a page screenshot on the left and its structure map on the right">
+</p>
 
-To start it from PowerShell, open this folder and run the following commands.
+PageAtlas captures a website or browser-based app and turns it into a design review. Mobile reviews contain individual viewport screenshots taken while scrolling each page. Desktop and tablet reviews use full-page screenshots. Export the review as one HTML file that opens offline in a browser, or as a PDF of the screenshots.
 
-```powershell
-npm.cmd ci
-npm.cmd run build
-npm.cmd start
+## Set it up on your computer
+
+Running PageAtlas on your own computer gives you every feature, including captures of local dev servers and pages that need a sign-in. Your captures never leave your computer.
+
+### 1. Install what PageAtlas needs
+
+- **Node.js 22.18 or newer.** Download the LTS version from [nodejs.org](https://nodejs.org). To check your version, open a terminal and run `node --version`.
+- **Microsoft Edge or Google Chrome.** PageAtlas uses the browser already installed on your computer to take screenshots. Edge comes with Windows.
+- **Git** (optional) to download and update the code. You can download a ZIP instead.
+
+### 2. Download PageAtlas
+
+With Git:
+
+```sh
+git clone https://github.com/Pongki69/PageAtlas.git
+cd PageAtlas
 ```
 
-Open [PageAtlas](http://127.0.0.1:4317) and leave the PowerShell window open while you use it. For development, `npm.cmd run dev` starts the app with live updates. To use another Chromium executable, set `PAGEATLAS_BROWSER` to its path before starting.
+Without Git, choose **Code → Download ZIP** on the [repository page](https://github.com/Pongki69/PageAtlas), then extract the ZIP to a folder such as your Desktop.
 
-After changing server files, choose **2. Restart server with the latest changes** from the launcher menu. `npm.cmd run dev` provides automatic reloads during development.
+### 3. Start PageAtlas
+
+**On Windows**, double-click **Start PageAtlas.bat** in the PageAtlas folder. The first start installs dependencies and builds the app, which takes a minute or two. Your browser opens PageAtlas when it's ready.
+
+The launcher's menu offers **1. Start / open**, **2. Restart server with the latest changes**, **3. Stop server**, and **4. Close this menu**. Closing the menu leaves PageAtlas running in the background; open the batch file again to stop or restart it. Only one launcher menu stays open per project and port, and double-clicking again opens the existing app. Stop and restart clear in-memory captures and reviews, so export anything you want to keep first.
+
+**From a terminal** (Windows, macOS, or Linux), run these commands in the PageAtlas folder:
+
+```sh
+npm ci
+npm run build
+npm start
+```
+
+In Windows PowerShell, type `npm.cmd` instead of `npm` if PowerShell blocks scripts. Keep the terminal open while you use PageAtlas.
+
+### 4. Open the app
+
+Go to [http://127.0.0.1:4317](http://127.0.0.1:4317). Choose **Start capturing**, paste a web address, and select **Capture app pages**. Bookmark `http://127.0.0.1:4317/#capture` to open the workspace directly.
+
+### Update to the latest version
+
+Run `git pull` in the PageAtlas folder (or download a new ZIP), then choose **2. Restart server with the latest changes** in the launcher, or run `npm ci`, `npm run build`, and `npm start` again.
+
+### If something goes wrong
+
+| Problem | What to do |
+| --- | --- |
+| `node` isn't recognized, or the launcher says Node.js is missing | Install Node.js 22.18 or newer, then open a new terminal or run the launcher again. |
+| "Install Microsoft Edge or Google Chrome" | Install one of them, or set `PAGEATLAS_BROWSER` to the full path of another Chromium-based browser before starting. |
+| "Port 4317 is already in use" | PageAtlas is probably already running, so open [http://127.0.0.1:4317](http://127.0.0.1:4317). To use another port, set the `PAGEATLAS_PORT` environment variable to a free port, such as `4400`, then start again. |
+| "Build PageAtlas with npm run build, then refresh" | Run `npm run build`, then reload the page. |
+
+### Develop PageAtlas
+
+`npm run dev` starts the app with live updates to the interface and automatic server restarts. `npm run check` type-checks the project, and `node --test server/*.test.ts server/*.test.mjs` runs the tests.
 
 ## Capture and export
 
