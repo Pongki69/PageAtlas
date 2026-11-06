@@ -1,21 +1,25 @@
 import {
-  ArrowDownToLine, ArrowRight, Camera, Check, ChevronRight, CircleAlert, ExternalLink,
+  ArrowDownToLine, ArrowRight, Camera, Check, ChevronLeft, ChevronRight, CircleAlert, ExternalLink,
   Focus, Globe2, Layers3, ListTree, LoaderCircle, LockKeyhole, Maximize2, MoveVertical,
-  Monitor, Moon, Smartphone, Sun, Tablet, Target,
+  Monitor, Moon, Smartphone, Square, Sun, Tablet, Target, X,
 } from 'lucide-react'
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react'
 import './index.css'
+const HomePage = lazy(() => import('./HomePage'))
+import { presetSizes, resolveCaptureViewport, viewportLimits, type ViewportMode } from '../shared/viewports.ts'
 
 const viewports = [
-  { id: 'desktop', label: 'Desktop', dimensions: '1440 × 900', icon: Monitor },
-  { id: 'tablet', label: 'Tablet', dimensions: '768 × 1024', icon: Tablet },
-  { id: 'mobile', label: 'Mobile', dimensions: '390 × 844', icon: Smartphone },
+  { id: 'auto', label: 'Current screen', icon: Maximize2 },
+  { id: 'desktop', label: 'Desktop', icon: Monitor },
+  { id: 'tablet', label: 'Tablet', icon: Tablet },
+  { id: 'mobile', label: 'Mobile', icon: Smartphone },
+  { id: 'custom', label: 'Custom', icon: Focus },
 ] as const
 
-type Viewport = typeof viewports[number]['id']
+type Viewport = ViewportMode
 type Theme = 'light' | 'dark'
 type CaptureActivity = 'capture' | 'open-sign-in' | 'capture-signed-in' | 'cancel-sign-in'
-type CaptureTarget = { url: string; viewport: Viewport; signIn: boolean; crawl: boolean }
+type CaptureTarget = { url: string; viewport: Viewport; width?: number; height?: number; signIn: boolean; crawl: boolean }
 
 const activityLabels: Record<CaptureActivity, string> = {
   capture: 'Waiting for page content and capturing its design…',
@@ -95,6 +99,34 @@ interface Review extends PageReview {
     viewsCaptured: number
     skipped: { label: string; reason: string }[]
   }
+}
+
+interface CaptureJob {
+  id: string
+  status: 'running' | 'cancelling' | 'complete' | 'cancelled' | 'failed'
+  progress: number
+  phase: string
+  startedAt: string
+  updatedAt: string
+  pagesCaptured?: number
+  viewsCaptured?: number
+  logs: { id: number; time: string; message: string }[]
+  result?: Review
+  error?: string
+  errorCode?: string
+  sessionId?: string
+  input?: { url: string; viewport: Viewport; width?: number; height?: number; crawl: boolean; allowDevCertificate: boolean }
+}
+
+function jobIsActive(job: CaptureJob | null) {
+  return job?.status === 'running' || job?.status === 'cancelling'
+}
+
+async function currentCaptureJob(signal?: AbortSignal): Promise<CaptureJob | null> {
+  const response = await fetch('/api/capture-job', { cache: 'no-store', signal })
+  if (!response.ok) throw new Error((await responseFailure(response, 'Couldn’t check the current capture.')).message)
+  const result: { job: CaptureJob | null } = await response.json()
+  return result.job
 }
 
 function initialTheme(): Theme {
@@ -314,11 +346,170 @@ function ExplorationSummary({ exploration }: { exploration: NonNullable<Review['
   )
 }
 
+function CaptureProgress({ job, stopping, onStop }: { job: CaptureJob; stopping: boolean; onStop: () => void }) {
+  const logScrollRef = useRef<HTMLDivElement>(null)
+  const followLogs = useRef(true)
+  const latestLogId = job.logs.at(-1)?.id
+  const active = jobIsActive(job)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [active])
+  const seconds = Math.max(0, Math.round(((active ? now : Date.parse(job.updatedAt)) - Date.parse(job.startedAt)) / 1000))
+  const elapsed = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`
+  const count = (value: number, noun: string) => `${value} ${noun}${value === 1 ? '' : 's'}`
+  const percent = job.status === 'complete' ? 100 : Math.max(0, Math.min(99, Math.round(job.progress)))
+  const title = job.status === 'running' ? 'Capture in progress'
+    : job.status === 'cancelling' ? 'Stopping capture'
+      : job.status === 'complete' ? 'Capture complete'
+        : job.status === 'cancelled' ? 'Capture stopped' : 'Capture needs attention'
+
+  useEffect(() => {
+    const log = logScrollRef.current
+    if (log && followLogs.current) log.scrollTop = log.scrollHeight
+  }, [latestLogId])
+
+  return (
+    <section className="workspace capture-progress" aria-labelledby="capture-progress-heading">
+      <div className="capture-progress-heading">
+        <div>
+          <h2 id="capture-progress-heading">{title}</h2>
+          <p role="status">{job.status === 'cancelling' ? 'Closing the capture browser…'
+            : job.status === 'complete' ? `Finished in ${elapsed}.`
+              : job.status === 'cancelled' ? `Stopped after ${elapsed}. Nothing was saved.`
+                : job.status === 'failed' ? `Stopped with an error after ${elapsed}. Check the activity log below.` : job.phase}</p>
+        </div>
+        {active && (
+          <button className="export-button stop-capture" type="button" onClick={onStop} disabled={stopping || job.status === 'cancelling'}>
+            {stopping || job.status === 'cancelling' ? <LoaderCircle className="spinner" size={16} aria-hidden="true" /> : <Square size={15} aria-hidden="true" />}
+            {stopping || job.status === 'cancelling' ? 'Stopping…' : 'Stop capture'}
+          </button>
+        )}
+      </div>
+      <div className="capture-progress-label">
+        <span>{active ? 'Estimated progress' : 'Progress'}</span>
+        <strong>{percent}%</strong>
+      </div>
+      <progress aria-label={active ? 'Estimated capture progress' : 'Capture progress'} max={100} value={percent}>{percent}%</progress>
+      <div className="capture-progress-meta">
+        <p>{active ? `Elapsed ${elapsed} · safe to refresh, the capture keeps running` : `Elapsed ${elapsed}`}</p>
+        <p>{count(job.pagesCaptured ?? 0, 'page')} · {count(job.viewsCaptured ?? 0, 'screenshot')}</p>
+      </div>
+      <details className="capture-logs" open={active || job.status === 'failed'}>
+        <summary>Activity log <span>{job.logs.length}</span></summary>
+        <div className="capture-log-scroll" ref={logScrollRef} tabIndex={0} role="region" aria-label="Capture activity log" onScroll={event => {
+          const log = event.currentTarget
+          followLogs.current = log.scrollHeight - log.clientHeight - log.scrollTop < 48
+        }}>
+          {job.logs.length ? (
+            <ol role="log" aria-live="polite" aria-relevant="additions">
+              {job.logs.map(entry => (
+                <li key={entry.id}>
+                  <time dateTime={entry.time}>{new Date(entry.time).toLocaleTimeString([], { hour12: false })}</time>
+                  <span>{entry.message}</span>
+                </li>
+              ))}
+            </ol>
+          ) : <p className="capture-log-empty">Waiting for the first capture event…</p>}
+        </div>
+      </details>
+    </section>
+  )
+}
+
+function CaptureViewer({ pages, initialPageId, onSelect, onClose }: {
+  pages: PageReview[]
+  initialPageId: string
+  onSelect: (pageId: string, shotId?: string) => void
+  onClose: () => void
+}) {
+  const pictures = pages.flatMap<{ pageId: string; shotId: string | undefined; url: string; name: string }>((page, index) => {
+    const name = page.navigationLabel || page.title || `Page ${index + 1}`
+    return page.viewportShots?.length ? page.viewportShots.map((shot, shotIndex) => ({
+      pageId: page.id, shotId: shot.id, url: shot.screenshotUrl,
+      name: page.viewportShots!.length > 1 ? `${name} · View ${shotIndex + 1} of ${page.viewportShots!.length}` : name,
+    })) : [{ pageId: page.id, shotId: undefined, url: page.screenshotUrl, name }]
+  })
+  const [index, setIndex] = useState(() => Math.max(0, pictures.findIndex(picture => picture.pageId === initialPageId)))
+  const [failed, setFailed] = useState(false)
+  const dialog = useRef<HTMLDialogElement>(null)
+  const pointer = useRef<{ x: number; y: number } | null>(null)
+  const picture = pictures[index]
+  useEffect(() => {
+    const element = dialog.current
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    element?.showModal()
+    return () => {
+      element?.close()
+      document.body.style.overflow = previousOverflow
+      if (opener?.isConnected) opener.focus({ preventScroll: true })
+    }
+  }, [])
+  function move(next: number) {
+    if (next < 0 || next >= pictures.length) return
+    setIndex(next)
+    setFailed(false)
+    const selected = pictures[next]!
+    onSelect(selected.pageId, selected.shotId)
+  }
+  if (!picture) return null
+  return <dialog ref={dialog} className="capture-viewer" aria-labelledby="viewer-title" aria-describedby="viewer-count" onCancel={event => { event.preventDefault(); onClose() }} onClick={event => {
+    if (event.target !== event.currentTarget) return
+    const bounds = event.currentTarget.getBoundingClientRect()
+    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose()
+  }} onKeyDown={event => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return
+    if (event.key === 'ArrowLeft') { event.preventDefault(); move(index - 1) }
+    if (event.key === 'ArrowRight') { event.preventDefault(); move(index + 1) }
+  }}>
+    <header className="viewer-header">
+      <div aria-live="polite"><h2 id="viewer-title">{picture.name}</h2><p id="viewer-count">Image {index + 1} of {pictures.length}</p></div>
+      <button type="button" className="icon-button" aria-label="Close image viewer" onClick={onClose} autoFocus><X size={21} aria-hidden="true" /></button>
+    </header>
+    <div className="viewer-stage">
+      <button type="button" className="icon-button viewer-nav" aria-label="Previous image" disabled={index === 0} onClick={() => move(index - 1)}><ChevronLeft size={25} aria-hidden="true" /></button>
+      <div className="viewer-image" onPointerDown={event => { if (event.pointerType === 'touch') pointer.current = { x: event.clientX, y: event.clientY } }} onPointerUp={event => {
+        const start = pointer.current
+        pointer.current = null
+        if (!start) return
+        const delta = event.clientX - start.x
+        if (Math.abs(delta) > 60 && Math.abs(delta) > Math.abs(event.clientY - start.y) * 1.5) move(index + (delta < 0 ? 1 : -1))
+      }} onPointerCancel={() => { pointer.current = null }}>
+        {failed ? <p role="alert">This image is no longer available. Close the viewer and capture the page again.</p> : <img key={picture.url} src={picture.url} alt={picture.name} onError={() => setFailed(true)} draggable={false} />}
+      </div>
+      <button type="button" className="icon-button viewer-nav" aria-label="Next image" disabled={index === pictures.length - 1} onClick={() => move(index + 1)}><ChevronRight size={25} aria-hidden="true" /></button>
+    </div>
+    <p className="viewer-help">Use the arrows to browse · Swipe on touch screens · Esc to close</p>
+  </dialog>
+}
+
 export default function App() {
+  const [screen, setScreen] = useState<'home' | 'capture'>(() => window.location.hash === '#capture' ? 'capture' : 'home')
+  useEffect(() => {
+    const navigate = () => {
+      if (!['', '#home', '#capture'].includes(window.location.hash)) return
+      setScreen(window.location.hash === '#capture' ? 'capture' : 'home')
+      window.scrollTo({ top: 0, behavior: 'instant' })
+    }
+    window.addEventListener('hashchange', navigate)
+    return () => window.removeEventListener('hashchange', navigate)
+  }, [])
   const [theme, setTheme] = useState(initialTheme)
   const [url, setUrl] = useState('')
   const [allowDevCertificate, setAllowDevCertificate] = useState(false)
-  const [viewport, setViewport] = useState<Viewport>('desktop')
+  const [viewport, setViewport] = useState<Viewport>('auto')
+  const [windowSize, setWindowSize] = useState<Size>(() => ({ width: window.innerWidth, height: window.innerHeight }))
+  const [customWidth, setCustomWidth] = useState('1920')
+  const [customHeight, setCustomHeight] = useState('1080')
+  useEffect(() => {
+    const resize = () => setWindowSize({ width: window.innerWidth, height: window.innerHeight })
+    window.addEventListener('resize', resize)
+    return () => window.removeEventListener('resize', resize)
+  }, [])
   const [crawl, setCrawl] = useState(true)
   const [sessionId, setSessionId] = useState(rememberedSession)
   const [signIn, setSignIn] = useState(sessionId !== null)
@@ -331,12 +522,24 @@ export default function App() {
   const [error, setError] = useState('')
   const [certificateRetry, setCertificateRetry] = useState<CaptureTarget | null>(null)
   const [imageError, setImageError] = useState(false)
+  const [job, setJob] = useState<CaptureJob | null>(null)
+  const [jobSyncing, setJobSyncing] = useState(true)
+  const [jobsSynced, setJobsSynced] = useState(false)
+  const [jobConnectionError, setJobConnectionError] = useState('')
+  const [stopping, setStopping] = useState(false)
+  const [reviewAction, setReviewAction] = useState<'export' | 'pdf' | 'delete' | null>(null)
+  const [viewerPageId, setViewerPageId] = useState<string | null>(null)
+  const jobRef = useRef<CaptureJob | null>(null)
+  const handledJob = useRef<string | null>(null)
+  const restoredInput = useRef<string | null>(null)
+  const dismissedReviews = useRef(new Set<string>())
   const sessionHeadingRef = useRef<HTMLHeadingElement>(null)
   const captureButtonRef = useRef<HTMLButtonElement>(null)
   const hadSession = useRef(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const screenshotRef = useRef<HTMLDivElement>(null)
-  const pending = activity !== null
+  const activeJob = jobIsActive(job)
+  const pending = activity !== null || activeJob || jobSyncing || !jobsSynced || reviewAction !== null
   const developmentOrigin = developmentCertificateOrigin(normalizeUrl(url))
   const capturedPages = review ? [review, ...(review.linkedPages ?? [])] : []
   const currentPage = capturedPages.find((page) => page.id === selectedPageId) ?? review
@@ -350,7 +553,7 @@ export default function App() {
   const screenshotLabel = currentShot || mobileReview ? 'Viewport screenshot' : 'Full-page screenshot'
   const selectedSection = previewSections.find((section) => section.id === selected)
   const scrollRegions = currentPage?.scrollRegions ?? []
-  const progress = activity && (crawl && (activity === 'capture' || activity === 'capture-signed-in')
+  const progress = jobSyncing ? 'Checking for a running capture…' : activeJob ? job?.phase : activity && (crawl && (activity === 'capture' || activity === 'capture-signed-in')
     ? 'Clicking navigation controls and capturing app screens…'
     : activityLabels[activity])
 
@@ -379,6 +582,50 @@ export default function App() {
     hadSession.current = sessionId !== null
   }, [pending, sessionId])
 
+  useEffect(() => {
+    const controller = new AbortController()
+    let disposed = false
+    void currentCaptureJob(controller.signal).then(current => {
+      if (disposed) return
+      applyCaptureJob(current)
+      setJobsSynced(true)
+      setJobConnectionError('')
+    }).catch(() => {
+      if (!disposed) setJobConnectionError('Couldn’t check the current capture. Reconnect before starting another capture.')
+    }).finally(() => {
+      if (!disposed) setJobSyncing(false)
+    })
+    return () => {
+      disposed = true
+      controller.abort()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!activeJob) return
+    let disposed = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const controller = new AbortController()
+    async function poll() {
+      try {
+        const current = await currentCaptureJob(controller.signal)
+        if (disposed) return
+        applyCaptureJob(current)
+        setJobsSynced(true)
+        setJobConnectionError('')
+      } catch {
+        if (!disposed) setJobConnectionError('Connection interrupted. Reconnecting to the running capture…')
+      }
+      if (!disposed) timer = setTimeout(() => void poll(), 800)
+    }
+    timer = setTimeout(() => void poll(), 800)
+    return () => {
+      disposed = true
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [activeJob, job?.id])
+
   function selectPage(id: string) {
     setSelectedPageId(id)
     setSelectedShotId(null)
@@ -397,6 +644,117 @@ export default function App() {
     setReview(result)
     const count = 1 + (result.linkedPages?.length ?? 0)
     setStatus(result.linkedPages ? `${count} ${count === 1 ? 'page' : 'pages'} captured` : 'Capture complete')
+  }
+
+  function clearReview(message: string) {
+    setViewerPageId(null)
+    if (review) dismissedReviews.current.add(review.id)
+    setReview(null)
+    selectPage('')
+    jobRef.current = null
+    setJob(null)
+    handledJob.current = null
+    restoredInput.current = null
+    setUrl('')
+    setError('')
+    setCertificateRetry(null)
+    setStatus(message)
+  }
+
+  async function finishReview(format: 'html' | 'pdf' | 'delete') {
+    if (!review || pending) return
+    const exporting = format !== 'delete'
+    setReviewAction(format === 'html' ? 'export' : format)
+    setError('')
+    try {
+      const response = await fetch(`/api/reviews/${encodeURIComponent(review.id)}${exporting ? format === 'pdf' ? '/export-pdf' : '/export' : ''}`, { method: exporting ? 'POST' : 'DELETE' })
+      if (!response.ok) throw new Error((await responseFailure(response, 'Couldn’t finish this review. Please try again.')).message)
+      if (exporting) {
+        const blob = await response.blob()
+        const objectUrl = URL.createObjectURL(blob)
+        const download = document.createElement('a')
+        download.href = objectUrl
+        download.download = `pageatlas-${format === 'pdf' ? 'captures' : 'review'}-${review.id.slice(0, 8)}.${format}`
+        download.click()
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+      }
+      clearReview(exporting ? `${format.toUpperCase()} download started. Captured data deleted from PageAtlas.` : 'Review deleted. Ready for a new capture.')
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Couldn’t finish this review. Please try again.')
+    } finally {
+      setReviewAction(null)
+    }
+  }
+
+  function applyCaptureJob(current: CaptureJob | null) {
+    if (current?.result && dismissedReviews.current.has(current.result.id)) return
+    const previous = jobRef.current
+    if (current && previous?.id === current.id && Date.parse(current.updatedAt) < Date.parse(previous.updatedAt)) return
+    if (current && previous?.id === current.id && ((previous.status === 'cancelling' && current.status === 'running') || (!jobIsActive(previous) && jobIsActive(current)))) return
+    jobRef.current = current
+    setJob(current)
+    if (!current) {
+      if (jobIsActive(previous)) {
+        setStatus('')
+        setError('The capture is no longer running. You can start a new capture.')
+      }
+      return
+    }
+
+    if (current.input && restoredInput.current !== current.id) {
+      restoredInput.current = current.id
+      setUrl(current.input.url)
+      setViewport(current.input.viewport)
+      if (current.input.viewport === 'custom' && current.input.width && current.input.height) {
+        setCustomWidth(String(current.input.width))
+        setCustomHeight(String(current.input.height))
+      }
+      setCrawl(current.input.crawl)
+      setAllowDevCertificate(current.input.allowDevCertificate)
+      setSignIn(false)
+    }
+    if (jobIsActive(current)) {
+      setSessionId(null)
+      if (previous?.id !== current.id) {
+        setError('')
+        setStatus('')
+        setCertificateRetry(null)
+      }
+      return
+    }
+    if (handledJob.current === current.id) return
+    handledJob.current = current.id
+    if (current.status === 'failed' && current.sessionId) setSessionId(current.sessionId)
+    else if (jobIsActive(previous)) setSessionId(null)
+    setCertificateRetry(null)
+    if (current.status === 'complete') {
+      setError('')
+      if (current.result) showReview(current.result)
+      else setStatus('Capture complete')
+    } else if (current.status === 'cancelled') {
+      setError('')
+      setStatus('Capture stopped')
+    } else {
+      setStatus('')
+      setError(current.error || 'The capture couldn’t finish. Review the activity log and try again.')
+      if (current.sessionId) setSignIn(true)
+      if (current.errorCode === 'LOCAL_DEV_CERTIFICATE_REQUIRED' && current.input && !current.input.allowDevCertificate) {
+        setCertificateRetry({ ...current.input, signIn: false })
+      }
+    }
+  }
+
+  async function syncCaptureJob() {
+    setJobSyncing(true)
+    try {
+      applyCaptureJob(await currentCaptureJob())
+      setJobsSynced(true)
+      setJobConnectionError('')
+    } catch {
+      setJobConnectionError('Couldn’t reconnect. Check that PageAtlas is running and try again.')
+    } finally {
+      setJobSyncing(false)
+    }
   }
 
   function changeUrl(value: string) {
@@ -427,7 +785,15 @@ export default function App() {
       return
     }
 
-    void requestCapture({ url: target, viewport, signIn, crawl }, Boolean(developmentOrigin && allowDevCertificate))
+    try {
+      const size = resolveCaptureViewport(viewport,
+        viewport === 'auto' ? window.innerWidth : Number(customWidth),
+        viewport === 'auto' ? window.innerHeight : Number(customHeight))
+      void requestCapture({ url: target, ...size, signIn, crawl }, Boolean(developmentOrigin && allowDevCertificate))
+    } catch (error) {
+      setStatus('')
+      setError(error instanceof Error ? error.message : 'Choose a valid capture size.')
+    }
   }
 
   async function requestCapture(target: CaptureTarget, useDevCertificate: boolean) {
@@ -438,22 +804,24 @@ export default function App() {
     setError('')
     setActivity(target.signIn ? 'open-sign-in' : 'capture')
     try {
-      const response = await fetch(target.signIn ? '/api/sign-in' : '/api/capture', {
+      const response = await fetch(target.signIn ? '/api/sign-in' : '/api/capture-job', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: target.url, viewport: target.viewport, crawl: target.crawl, allowDevCertificate: useDevCertificate }),
+        body: JSON.stringify({ url: target.url, viewport: target.viewport, width: target.width, height: target.height, crawl: target.crawl, allowDevCertificate: useDevCertificate }),
       })
       if (!response.ok) {
         const failure = await responseFailure(response, 'The capture service is unavailable. Try again in a moment.')
         setError(failure.message)
         if (!useDevCertificate && failure.code === 'LOCAL_DEV_CERTIFICATE_REQUIRED') setCertificateRetry(target)
+        if (response.status === 409 || response.status === 429) await syncCaptureJob()
         return
       }
       if (target.signIn) {
         const result: { id: string } = await response.json()
         setSessionId(result.id)
       } else {
-        showReview(await response.json())
+        const result: { job: CaptureJob } = await response.json()
+        applyCaptureJob(result.job)
       }
     } catch {
       setError('Couldn’t reach the capture service. Check that PageAtlas is running and try again.')
@@ -468,18 +836,44 @@ export default function App() {
     setError('')
     setActivity('capture-signed-in')
     try {
-      const response = await fetch(`/api/sign-in/${encodeURIComponent(sessionId)}/capture`, { method: 'POST' })
+      const response = await fetch('/api/capture-job', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      })
       if (!response.ok) {
         setError((await responseFailure(response, 'Couldn’t capture the signed-in page. Try again.')).message)
         if (response.status !== 409 && response.status !== 429) setSessionId(null)
+        if (response.status === 409 || response.status === 429) await syncCaptureJob()
         return
       }
       setSessionId(null)
-      showReview(await response.json())
+      const result: { job: CaptureJob } = await response.json()
+      applyCaptureJob(result.job)
     } catch {
       setError('Couldn’t reach the capture service. Check that PageAtlas is running and try again.')
     } finally {
       setActivity(null)
+    }
+  }
+
+  async function stopCapture() {
+    const current = jobRef.current
+    if (!current || !jobIsActive(current) || current.status === 'cancelling' || stopping) return
+    setStopping(true)
+    setError('')
+    try {
+      const response = await fetch(`/api/capture-job/${encodeURIComponent(current.id)}/cancel`, { method: 'POST' })
+      if (!response.ok) {
+        setError((await responseFailure(response, 'Couldn’t stop this capture. Try again.')).message)
+        return
+      }
+      const result: { job: CaptureJob } = await response.json()
+      applyCaptureJob(result.job)
+    } catch {
+      setError('Couldn’t reach the capture service to stop it. Reconnect and try again.')
+    } finally {
+      setStopping(false)
     }
   }
 
@@ -522,16 +916,16 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <a className="skip-link" href="#main-content">Skip to capture</a>
+      <a className="skip-link" href="#main-content">Skip to content</a>
       <header className="app-header">
         <div className="page-container header-content">
-          <div className="brand">
+          <a className="brand" href="#home" aria-label="PageAtlas home">
             <span className="brand-mark"><Layers3 size={21} strokeWidth={2.2} aria-hidden="true" /></span>
             <span>PageAtlas</span>
             <span className="brand-context">Design review</span>
-          </div>
+          </a>
           <div className="header-actions">
-            <span className="local-indicator"><span aria-hidden="true" /> Local workspace</span>
+            <nav className="site-nav" aria-label="Main navigation"><a className="nav-home" href="#home" aria-current={screen === 'home' ? 'page' : undefined}>Home</a><a href="#capture" aria-current={screen === 'capture' ? 'page' : undefined}>Capture</a></nav>
             <button
               type="button"
               className="icon-button"
@@ -545,11 +939,12 @@ export default function App() {
         </div>
       </header>
 
-      <main className="page-container main-content" id="main-content">
+      <main className={`page-container ${screen === 'home' ? 'landing-main' : 'main-content'}`} id="main-content">
+        {screen === 'home' ? <Suspense fallback={<p className="landing-loading" role="status">Loading PageAtlas…</p>}><HomePage /></Suspense> : <>
         <section className="intro" aria-labelledby="intro-heading">
-          <p className="eyebrow"><Focus size={15} aria-hidden="true" /> Visual page audit</p>
-          <h1 id="intro-heading">See the whole page<span>.</span></h1>
-          <p>Capture page designs, explore their structure, and export a review you can share.</p>
+          <p className="eyebrow"><Focus size={15} aria-hidden="true" /> Capture workspace</p>
+          <h1 id="intro-heading">Capture your next page<span>.</span></h1>
+          <p>Choose a website and screen size. Explore its pages, then export a visual review.</p>
         </section>
 
         {sessionId ? (
@@ -600,7 +995,10 @@ export default function App() {
             <fieldset className="viewport-field" disabled={pending}>
               <legend className="field-label">Viewport</legend>
               <div className="viewport-options">
-                {viewports.map(({ id, label, dimensions, icon: Icon }) => (
+                {viewports.map(({ id, label, icon: Icon }) => {
+                  const size = id === 'auto' ? windowSize : id === 'custom' ? { width: customWidth, height: customHeight } : presetSizes[id]
+                  const dimensions = `${size.width} × ${size.height}`
+                  return (
                   <label key={id} className="viewport-option" title={`${label} (${dimensions})`}>
                     <input type="radio" name="viewport" value={id} checked={viewport === id} onChange={() => {
                       clearCertificateRetry()
@@ -608,11 +1006,17 @@ export default function App() {
                     }} />
                     <span><Icon size={17} aria-hidden="true" />{label}<span className="sr-only"> ({dimensions} pixels)</span></span>
                   </label>
-                ))}
+                  )
+                })}
               </div>
+              {viewport === 'auto' && <p className="viewport-mode-help">{windowSize.width} × {windowSize.height} pixels. Matches this browser’s visible page area; resize the window to change it.</p>}
+              {viewport === 'custom' && <div className="custom-viewport">
+                <label>Width (px)<input type="number" min={viewportLimits.minWidth} max={viewportLimits.maxWidth} step="1" required value={customWidth} onChange={event => { clearCertificateRetry(); setCustomWidth(event.currentTarget.value) }} /></label>
+                <label>Height (px)<input type="number" min={viewportLimits.minHeight} max={viewportLimits.maxHeight} step="1" required value={customHeight} onChange={event => { clearCertificateRetry(); setCustomHeight(event.currentTarget.value) }} /></label>
+              </div>}
               {viewport === 'mobile' && <p className="viewport-mode-help">Mobile captures each scroll position as a separate viewport screenshot.</p>}
             </fieldset>
-            <div>
+            <div className="capture-options">
               <div className="capture-option">
                 <label>
                   <input type="checkbox" checked={crawl} disabled={pending} aria-describedby="linked-pages-help" onChange={event => {
@@ -645,7 +1049,7 @@ export default function App() {
             </div>
             <button className="capture-button" type="submit" disabled={pending} ref={captureButtonRef}>
               {pending ? <LoaderCircle className="spinner" size={19} aria-hidden="true" /> : <Camera size={19} aria-hidden="true" />}
-              {activity === 'open-sign-in' ? 'Opening browser…' : pending ? 'Capturing…' : signIn ? 'Open sign-in window' : crawl ? 'Capture app pages' : 'Capture page'}
+              {jobSyncing ? 'Checking capture…' : !jobsSynced ? 'Capture unavailable' : activeJob ? 'Capture in progress' : activity === 'open-sign-in' ? 'Opening browser…' : pending ? 'Starting capture…' : signIn ? 'Open sign-in window' : crawl ? 'Capture app pages' : 'Capture page'}
               {!pending && (signIn ? <ExternalLink size={17} aria-hidden="true" /> : <ArrowRight size={17} aria-hidden="true" />)}
             </button>
           </form>
@@ -658,6 +1062,14 @@ export default function App() {
           </p>
         </div>
 
+        {jobConnectionError && (
+          <div className="notice error-notice capture-error">
+            <p role="alert"><CircleAlert size={18} aria-hidden="true" />{jobConnectionError}</p>
+            <button type="button" className="export-button" disabled={jobSyncing} onClick={() => void syncCaptureJob()}>
+              {jobSyncing ? 'Reconnecting…' : 'Reconnect'}
+            </button>
+          </div>
+        )}
         {error && (
           <div className="notice error-notice capture-error">
             <p role="alert"><CircleAlert size={18} aria-hidden="true" />{error}</p>
@@ -668,6 +1080,7 @@ export default function App() {
             )}
           </div>
         )}
+        {job && <CaptureProgress key={job.id} job={job} stopping={stopping} onStop={() => void stopCapture()} />}
         {currentPage?.warnings.map((warning, index) => <p className="notice" key={`${index}-${warning}`}><CircleAlert size={18} aria-hidden="true" />{warning}</p>)}
 
         <section className="workspace" aria-labelledby="workspace-heading" aria-busy={pending}>
@@ -686,12 +1099,20 @@ export default function App() {
                     {scrollRegions.length} {scrollRegions.length === 1 ? 'scroll area' : 'scroll areas'} ↓
                   </a>
                 )}
-                <a className="export-button" href={`/api/reviews/${encodeURIComponent(review.id)}/export`} download>
-                  <ArrowDownToLine size={18} aria-hidden="true" /> {capturedPages.length > 1 ? 'Export all pages' : 'Export review'}
-                </a>
+                <button type="button" className="export-button" disabled={pending} onClick={() => void finishReview('pdf')} title="All captured page screenshots, without review controls or structure maps">
+                  <ArrowDownToLine size={18} aria-hidden="true" /> {reviewAction === 'pdf' ? 'Creating PDF…' : 'Export all pages as PDF'}
+                </button>
+                <button type="button" className="export-button" disabled={pending} onClick={() => void finishReview('html')}>
+                  <ArrowDownToLine size={18} aria-hidden="true" /> {reviewAction === 'export' ? 'Exporting…' : capturedPages.length > 1 ? 'Export all pages' : 'Export review'}
+                </button>
+                <button type="button" className="export-button" disabled={pending} onClick={() => void finishReview('delete')}>
+                  <Check size={18} aria-hidden="true" /> {reviewAction === 'delete' ? 'Deleting…' : 'Done · delete review'}
+                </button>
               </div>
             )}
           </div>
+
+          {review && <p className="review-privacy">Temporary review · Exporting or choosing Done deletes screenshots, page details, and capture history from PageAtlas. Unfinished reviews expire after 15 minutes.</p>}
 
           {review?.exploration && <ExplorationSummary exploration={review.exploration} />}
 
@@ -769,6 +1190,27 @@ export default function App() {
             </div>
             <StructurePanel key={`${currentPage?.id}-${currentShot?.id ?? 'page'}`} review={currentPage ? { sections: previewSections } : null} selected={selected} onSelect={selectSection} />
           </div>
+          {review && <nav className="capture-gallery" aria-label="Captured page gallery">
+            <div className="gallery-heading">
+              <h3>All captured pages</h3>
+              <span className="count-badge">{capturedPages.length}</span>
+            </div>
+            <ol className="gallery-strip">
+              {capturedPages.map((page, index) => {
+                const name = page.navigationLabel || page.title || `Page ${index + 1}`
+                return <li key={page.id}>
+                  <button type="button" className="gallery-thumbnail" aria-label={`View page ${index + 1}: ${name}`} aria-pressed={currentPage?.id === page.id} onClick={() => {
+                    selectPage(page.id)
+                    setViewerPageId(page.id)
+                  }}>
+                    <img src={page.viewportShots?.[0]?.screenshotUrl ?? page.screenshotUrl} alt="" loading="lazy" decoding="async" />
+                    <span className="gallery-number" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
+                    <span className="gallery-caption" aria-hidden="true">{name}</span>
+                  </button>
+                </li>
+              })}
+            </ol>
+          </nav>}
         </section>
 
         {currentPage && !currentShot && (
@@ -791,11 +1233,36 @@ export default function App() {
           </section>
         )}
 
+        </>}
         <footer className="app-footer">
-          <span><Layers3 size={15} aria-hidden="true" /> PageAtlas</span>
-          <p>Each review exports as one self-contained HTML file.</p>
+          <div className="footer-main">
+            <div className="footer-product">
+              <a className="footer-brand" href="#home"><span className="footer-brand-mark"><Layers3 size={22} aria-hidden="true" /></span> PageAtlas</a>
+              <p>A clearer view of every page. Built for the details that matter.</p>
+              <span className="footer-status"><span className="footer-status-dot" aria-hidden="true" /> Runs locally on your computer</span>
+            </div>
+            <nav className="footer-nav" aria-label="Footer navigation">
+              <p className="footer-credit-label">Explore</p>
+              <div><a href="#home">Home <ChevronRight size={14} aria-hidden="true" /></a><a href="#capture">Capture workspace <ChevronRight size={14} aria-hidden="true" /></a></div>
+            </nav>
+            <div className="developer-credit">
+              <p className="footer-credit-label">Made by</p>
+              <a href="https://www.facebook.com/Pongki23/" target="_blank" rel="noopener noreferrer"><span className="developer-avatar" aria-hidden="true">AP</span><span className="developer-name">Alfonso A. Panisales<small>Designer & developer · Connect on Facebook</small></span><ArrowRight size={17} aria-hidden="true" /><span className="sr-only"> (Facebook, opens in a new tab)</span></a>
+            </div>
+          </div>
+          <div className="footer-bottom">
+            <span className="footer-privacy"><LockKeyhole size={13} aria-hidden="true" /> Temporary captures. Your exports to keep.</span>
+            <div className="footer-bottom-end">
+              <p className="footer-copyright">© {new Date().getFullYear()} PageAtlas</p>
+              <button type="button" className="footer-top" onClick={() => window.scrollTo({ top: 0, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' })}>Back to top <ArrowRight size={13} aria-hidden="true" /></button>
+            </div>
+          </div>
         </footer>
       </main>
+      {review && viewerPageId && <CaptureViewer key={review.id} pages={capturedPages} initialPageId={viewerPageId} onClose={() => setViewerPageId(null)} onSelect={(pageId, shotId) => {
+        selectPage(pageId)
+        setSelectedShotId(shotId ?? null)
+      }} />}
     </div>
   )
 }

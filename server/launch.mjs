@@ -1,10 +1,13 @@
 import { spawn } from 'node:child_process';
+import { closeSync, openSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 const commandShell = process.env.ComSpec || 'cmd.exe';
+const background = process.argv.includes('--background');
+const noBrowser = process.argv.includes('--no-browser');
 
 async function appState(url) {
   try {
@@ -34,6 +37,7 @@ function runNpm(command) {
 
 async function openBrowser(url) {
   console.log(`Open PageAtlas at ${url}`);
+  if (noBrowser) return;
   const child = spawn(commandShell, ['/d', '/c', 'start', '', url], {
     stdio: 'ignore',
     windowsHide: true,
@@ -61,6 +65,27 @@ async function main() {
     throw new Error('PAGEATLAS_PORT must be a whole number between 1024 and 65535.');
   }
   const url = `http://127.0.0.1:${port}/`;
+  if (process.argv.includes('--open')) {
+    await openBrowser(url);
+    return;
+  }
+  if (process.argv.includes('--stop') || process.argv.includes('--restart')) {
+    const stopCode = await new Promise((resolve, reject) => {
+      const child = spawn('powershell.exe', [
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+        fileURLToPath(new URL('./stop-server.ps1', import.meta.url)), '-Port', String(port),
+      ], { cwd: projectRoot, stdio: 'inherit', windowsHide: true });
+      child.once('error', reject);
+      child.once('exit', resolve);
+    });
+    if (stopCode !== 0) throw new Error('The server was left unchanged. See the message above.');
+    if (process.argv.includes('--stop')) return;
+    const deadline = Date.now() + 5000;
+    while (await appState(url) !== 'offline') {
+      if (Date.now() >= deadline) throw new Error('The server has not finished stopping. Try again.');
+      await delay(100);
+    }
+  }
   const existing = await appState(url);
   if (existing === 'running') {
     console.log('PageAtlas is already running. Opening it in your browser.');
@@ -80,12 +105,21 @@ async function main() {
   console.log('Preparing the latest PageAtlas build.');
   await runNpm('run build');
 
-  const server = spawn(process.execPath, ['server/index.ts'], {
-    cwd: projectRoot,
-    stdio: 'inherit',
-    windowsHide: true,
-  });
+  const logPath = fileURLToPath(new URL(`../pageatlas-server-${port}.log`, import.meta.url));
+  const log = background ? openSync(logPath, 'w') : undefined;
+  let server;
+  try {
+    server = spawn(process.execPath, ['server/index.ts'], {
+      cwd: projectRoot,
+      stdio: background ? ['ignore', log, log] : 'inherit',
+      detached: background,
+      windowsHide: true,
+    });
+  } finally {
+    if (log !== undefined) closeSync(log);
+  }
   let ended = false;
+  let keepRunning = false;
   const serverExit = new Promise((resolve, reject) => {
     server.once('error', reject);
     server.once('exit', code => {
@@ -109,14 +143,21 @@ async function main() {
       await delay(250);
     }
     if (!ready) throw new Error('PageAtlas did not start. Check the server message above.');
-    console.log('Keep this window open while using PageAtlas. Press Ctrl+C to stop it.');
+    console.log(background
+      ? 'PageAtlas is running. Use the launcher menu to restart or stop the server.'
+      : 'Keep this window open while using PageAtlas. Press Ctrl+C to stop it.');
     await openBrowser(url);
+    if (background) {
+      keepRunning = true;
+      server.unref();
+      return;
+    }
     const code = await serverExit;
     if (code && code !== 0) throw new Error(`PageAtlas stopped with exit code ${code}.`);
   } finally {
     process.removeListener('SIGINT', stopServer);
     process.removeListener('SIGTERM', stopServer);
-    if (!ended) server.kill();
+    if (!ended && !keepRunning) server.kill();
   }
 }
 

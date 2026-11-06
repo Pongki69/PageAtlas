@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Page } from 'playwright-core';
 import type { NavigationTarget } from './navigation.ts';
+import { readNavigationState } from './navigation-state.ts';
 
 export type NavigationProbeResult = {
   url: string;
@@ -15,9 +16,16 @@ export async function probeNavigation(page: Page, target: NavigationTarget): Pro
   const beforeUrl = page.url();
   if (!target.control || page.isClosed()) return { url: beforeUrl, changed: false, blocked: true, clicked: false, reason: 'The navigation control is no longer available.' };
   const deadline = Date.now() + 6000;
+  const context = await readNavigationState(page);
+  if (target.sourceKey && target.sourceKey !== context.key) {
+    return { url: beforeUrl, changed: false, blocked: true, clicked: false, reason: 'The source view changed before this navigation step could be restored.' };
+  }
   const control = page.locator(target.control.selector);
   if (await control.count() !== 1 || !await control.isVisible()) {
     return { url: beforeUrl, changed: false, blocked: true, clicked: false, reason: 'The navigation control was hidden or could not be identified uniquely.' };
+  }
+  if (context.scopeSelector && !await control.evaluate((element, selector) => document.querySelector(selector)?.contains(element), context.scopeSelector)) {
+    return { url: beforeUrl, changed: false, blocked: true, clicked: false, reason: 'The control is outside the active dialog.' };
   }
   const ineligibleReason = await control.evaluate((element, expectedLabel) => {
     if (element.closest('form, [inert]') || element.matches('[form], [type=submit], [type=reset]')) return 'The control belongs to a form or an inactive view.';

@@ -13,9 +13,22 @@ import type { Browser, BrowserContext, ElementHandle, Page } from "playwright-co
 import { discoverNavigation, isUnsafeActionUrl, navigationUrl as crawlRoute } from "./navigation.ts";
 import type { NavigationTarget } from "./navigation.ts";
 import { probeNavigation } from "./navigation-probe.ts";
+import { readNavigationState } from "./navigation-state.ts";
 
 type Dimensions = { width: number; height: number };
 export type CaptureRequest = Dimensions & { url: string; allowDevCertificate?: boolean; crawl?: boolean };
+
+export type CaptureProgress = {
+  phase: string;
+  message: string;
+  pagesCaptured?: number;
+  viewsCaptured?: number;
+};
+
+export type CaptureRuntime = {
+  signal?: AbortSignal;
+  onProgress?: (event: CaptureProgress) => void;
+};
 
 export type Section = Dimensions & {
   id: string;
@@ -70,16 +83,16 @@ export type CaptureResult = {
 };
 
 export type InteractiveCapture = {
-  capture(): Promise<CaptureResult>;
+  capture(runtime?: CaptureRuntime): Promise<CaptureResult>;
   close(): Promise<void>;
   isOpen(): boolean;
 };
 
 export class CaptureError extends Error {
   readonly status: number;
-  readonly code?: 'LOCAL_DEV_CERTIFICATE_REQUIRED' | 'CONTENT_NOT_READY';
+  readonly code?: 'LOCAL_DEV_CERTIFICATE_REQUIRED' | 'CONTENT_NOT_READY' | 'CAPTURE_CANCELLED';
 
-  constructor(status: number, message: string, code?: 'LOCAL_DEV_CERTIFICATE_REQUIRED' | 'CONTENT_NOT_READY') {
+  constructor(status: number, message: string, code?: 'LOCAL_DEV_CERTIFICATE_REQUIRED' | 'CONTENT_NOT_READY' | 'CAPTURE_CANCELLED') {
     super(message);
     this.name = "CaptureError";
     this.status = status;
@@ -108,6 +121,61 @@ const SCROLL_TILE_LIMIT = 96;
 const SCROLL_PIXEL_LIMIT = 12_000_000;
 const SCROLL_IMAGE_BYTES = 16 * 1024 * 1024;
 const PNG_PREFIX = "data:image/png;base64,";
+
+type CaptureRun = { runtime: CaptureRuntime; pagesCaptured: number; viewsCaptured: number };
+const activeRuns = new WeakMap<Page, CaptureRun>();
+const contentReady = new WeakMap<Page, { signature: string; url: string; checkedAt: number }>();
+
+function cancelled() {
+  return new CaptureError(499, "The capture was stopped.", "CAPTURE_CANCELLED");
+}
+
+function checkRuntime(runtime?: CaptureRuntime) {
+  if (runtime?.signal?.aborted) throw cancelled();
+}
+
+function checkCapture(page: Page) {
+  checkRuntime(activeRuns.get(page)?.runtime);
+}
+
+function notifyRuntime(runtime: CaptureRuntime | undefined, event: CaptureProgress) {
+  try {
+    runtime?.onProgress?.(event);
+  } catch {
+    // Capture output must remain usable when a progress consumer disconnects.
+  }
+}
+
+function captureProgress(page: Page, phase: string, message: string, captured?: 'page' | 'view') {
+  checkCapture(page);
+  const run = activeRuns.get(page);
+  if (!run) return;
+  if (captured === 'page') run.pagesCaptured++;
+  if (captured === 'view') run.viewsCaptured++;
+  notifyRuntime(run.runtime, { phase, message, pagesCaptured: run.pagesCaptured, viewsCaptured: run.viewsCaptured });
+}
+
+function bindRuntime(session: CaptureBrowser, runtime: CaptureRuntime = {}) {
+  const run: CaptureRun = { runtime, pagesCaptured: 0, viewsCaptured: 0 };
+  const attached = new Set<Page>();
+  const attach = (page: Page) => {
+    attached.add(page);
+    activeRuns.set(page, run);
+  };
+  for (const page of session.context.pages()) attach(page);
+  session.context.on('page', attach);
+  const abort = () => { void session.close().catch(() => {}); };
+  runtime.signal?.addEventListener('abort', abort, { once: true });
+  if (runtime.signal?.aborted) abort();
+  return () => {
+    runtime.signal?.removeEventListener('abort', abort);
+    session.context.off('page', attach);
+    for (const page of attached) {
+      activeRuns.delete(page);
+      contentReady.delete(page);
+    }
+  };
+}
 
 const privateAddresses = new BlockList();
 for (const [network, prefix] of [
@@ -160,7 +228,8 @@ export function isOnThisComputer(hostname: string) {
   return isLocalHost(normalizeHost(hostname), assignedAddresses());
 }
 
-async function readLocalCertificate(target: URL) {
+async function readLocalCertificate(target: URL, runtime?: CaptureRuntime) {
+  checkRuntime(runtime);
   const host = normalizeHost(target.hostname);
   if (target.protocol !== "https:" || !isOnThisComputer(host)) {
     throw new CaptureError(400, "A development certificate can only be allowed for an HTTPS address on this computer.");
@@ -170,6 +239,7 @@ async function readLocalCertificate(target: URL) {
     ? (await lookup(host, { all: true, order: "ipv4first" }).catch(() => [])).map(({ address }) => address).filter(isLoopback)
     : [host];
   for (const address of addresses) {
+    checkRuntime(runtime);
     const fingerprint = await new Promise<string | undefined>(resolve => {
       // Read the presented certificate only. This connection sends no HTTP request or credentials.
       const socket = connectTls({
@@ -177,11 +247,15 @@ async function readLocalCertificate(target: URL) {
         ...(host === "localhost" && { servername: host }),
       });
       const timer = setTimeout(() => finish(), 2500);
+      const abort = () => finish();
       function finish(fingerprint?: string) {
         clearTimeout(timer);
+        runtime?.signal?.removeEventListener('abort', abort);
         socket.destroy();
         resolve(fingerprint);
       }
+      runtime?.signal?.addEventListener('abort', abort, { once: true });
+      if (runtime?.signal?.aborted) finish();
       socket.once("error", () => finish());
       socket.once("secureConnect", () => {
         try {
@@ -192,6 +266,7 @@ async function readLocalCertificate(target: URL) {
         }
       });
     });
+    checkRuntime(runtime);
     if (fingerprint) return { address: normalizeHost(address), fingerprint };
   }
   throw new CaptureError(422, "PageAtlas could not read a development certificate at that HTTPS address. Check that the local app is running.");
@@ -351,7 +426,7 @@ async function startCaptureProxy(target: URL, pinnedLocalAddress?: string) {
   };
 }
 
-function browserExecutable() {
+export function browserExecutable() {
   const override = process.env.PAGEATLAS_BROWSER;
   const programRoots = [process.env["ProgramFiles(x86)"], process.env.ProgramFiles, process.env.LOCALAPPDATA];
   const candidates = [
@@ -378,7 +453,9 @@ async function waitForContent(page: Page, deadline: number, initial = false): Pr
   const until = Math.min(deadline, startedAt + (initial ? 15000 : 6000));
   let signature = "";
   let stableSince = startedAt;
+  let heartbeatAt = startedAt;
   while (Date.now() < until) {
+    checkCapture(page);
     const state = await page.evaluate(() => {
       const body = document.body;
       if (!body || document.readyState === "loading") return { ready: false, signature: "" };
@@ -424,16 +501,29 @@ async function waitForContent(page: Page, deadline: number, initial = false): Pr
         signature: JSON.stringify([
           content.slice(0, 6000).replace(/\d/g, "#"), main.childElementCount,
           Math.round(bounds.width), Math.round(bounds.height), main.scrollHeight,
-          document.documentElement.scrollHeight, images.length,
+          document.documentElement.scrollHeight, images.length, window.scrollX, window.scrollY,
         ]),
       };
     });
     const now = Date.now();
+    checkCapture(page);
+    const recent = contentReady.get(page);
+    if (!initial && state.ready && recent?.signature === state.signature
+      && recent.url === page.url() && now - recent.checkedAt < 500) return;
     if (!state.ready || state.signature !== signature) stableSince = now;
     signature = state.signature;
-    if (state.ready && now - stableSince >= 400 && now - startedAt >= (initial ? 800 : 400)) return;
-    await delay(Math.min(150, Math.max(1, until - now)));
+    // Follow-up checks (after scrolling or clicking) settle faster than the first page load.
+    if (state.ready && now - stableSince >= (initial ? 400 : 250) && now - startedAt >= (initial ? 800 : 250)) {
+      contentReady.set(page, { signature, url: page.url(), checkedAt: now });
+      return;
+    }
+    if (now - heartbeatAt >= 3000) {
+      captureProgress(page, 'loading', 'Still waiting for loaded content.');
+      heartbeatAt = now;
+    }
+    await delay(Math.min(initial ? 150 : 100, Math.max(1, until - now)));
   }
+  checkCapture(page);
   throw new CaptureError(409, "The app is still showing loading content. Wait for it to finish loading, then capture again.", "CONTENT_NOT_READY");
 }
 
@@ -442,7 +532,9 @@ async function warmPage(page: Page, viewport: Dimensions, deadline: number) {
   const maxSteps = Math.ceil(MAX_HEIGHT / step);
   let reachedEnd = false;
   for (let index = 0; index <= maxSteps; index++) {
+    checkCapture(page);
     const top = index * step;
+    if (index > 0 && index % 4 === 0) captureProgress(page, 'scrolling', 'Loading content farther down the page.');
     await page.evaluate(top => window.scrollTo({ left: 0, top, behavior: "instant" }), top);
     await waitForContent(page, deadline);
     reachedEnd = await page.evaluate(({ top, maxHeight }) => {
@@ -564,6 +656,7 @@ async function captureScrollRegion(
   budget: { tiles: number; until: number },
   attempt = 0,
 ): Promise<ScrollRegion | undefined> {
+  checkCapture(page);
   const state = await element.evaluateHandle(el => {
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     const style = getComputedStyle(el);
@@ -618,16 +711,22 @@ async function captureScrollRegion(
     let partialReason: string | undefined;
 
     for (let y = 0; y < height; y += layout.height) {
+      checkCapture(page);
       const row: ScrollTile[] = [];
       const tileHeight = Math.min(layout.height, height - y);
       for (let x = 0; x < width && Date.now() < budget.until - 800; x += layout.width) {
+        checkCapture(page);
         const tileWidth = Math.min(layout.width, width - x);
-        await element.evaluate((el, { x, y, rtl }) => el.scrollTo({
-          left: rtl ? x - (el.scrollWidth - el.clientWidth) : x, top: y, behavior: "instant",
-        }), { x, y, rtl: layout.rtl });
+        const moved = await element.evaluate((el, { x, y, rtl }) => {
+          const before = { x: el.scrollLeft, y: el.scrollTop };
+          el.scrollTo({ left: rtl ? x - (el.scrollWidth - el.clientWidth) : x, top: y, behavior: "instant" });
+          return before.x !== el.scrollLeft || before.y !== el.scrollTop;
+        }, { x, y, rtl: layout.rtl });
+        if (moved) contentReady.delete(page);
         try {
           await waitForContent(page, budget.until - 250);
         } catch (error) {
+          checkCapture(page);
           if (!(error instanceof CaptureError) || error.code !== 'CONTENT_NOT_READY') throw error;
           partialReason = Date.now() >= budget.until - 400
             ? "The panel reached its capture time allowance." : "The panel was still loading.";
@@ -676,6 +775,7 @@ async function captureScrollRegion(
           fullPage: true, clip: geometry.clip, type: "png", caret: "hide", scale: "css",
           timeout: Math.min(2000, budget.until - Date.now() - 200),
         }).catch(() => undefined);
+        checkCapture(page);
         if (!png || png.readUInt32BE(16) !== tileWidth || png.readUInt32BE(20) !== tileHeight) {
           partialReason = "The browser could not capture the next section of this panel.";
           break;
@@ -712,6 +812,7 @@ async function captureScrollRegion(
     if (resized && attempt === 0 && budget.tiles && Date.now() < budget.until - 2000) {
       await state.evaluate(state => state.restore());
       const retried = await captureScrollRegion(page, element, compose, id, budget, 1).catch(() => undefined);
+      checkCapture(page);
       if (retried?.complete || !result || (retried && retried.height >= result.height)) result = retried ?? result;
     }
     if (!result) throw new CaptureError(422, `${label} could not be captured. ${partialReason || 'The panel was not visible.'}`);
@@ -723,6 +824,7 @@ async function captureScrollRegion(
 }
 
 async function captureScrollRegions(page: Page, until: number, output: ScrollCapture) {
+  checkCapture(page);
   const list = await page.evaluateHandle(limit => {
     const candidates: HTMLElement[] = [];
     if (!document.body) return candidates;
@@ -769,6 +871,7 @@ async function captureScrollRegions(page: Page, until: number, output: ScrollCap
   try {
     if (handles.size > SCROLL_REGION_LIMIT) output.omitted = true;
     for (const [index, handle] of handles) {
+      checkCapture(page);
       if (Number(index) >= SCROLL_REGION_LIMIT || !budget.tiles || Date.now() >= until - 400) {
         output.omitted = true;
         break;
@@ -776,8 +879,10 @@ async function captureScrollRegions(page: Page, until: number, output: ScrollCap
       const element = handle.asElement() as ElementHandle<HTMLElement> | null;
       const remainingRegions = Math.min(handles.size, SCROLL_REGION_LIMIT) - Number(index) - 1;
       const panelBudget = { tiles: budget.tiles, until: Math.min(until, Math.max(Date.now() + 700, until - remainingRegions * 1000)) };
+      captureProgress(page, 'panels', `Capturing scrollable area ${Number(index) + 1}.`);
       const panel = element && await captureScrollRegion(page, element, compose, `scroll-${Number(index) + 1}`, panelBudget)
         .catch((error: unknown) => {
+          checkCapture(page);
           if (error instanceof CaptureError) output.notices.push(error.message);
           return undefined;
         });
@@ -786,6 +891,7 @@ async function captureScrollRegions(page: Page, until: number, output: ScrollCap
         bytes += Buffer.byteLength(panel.screenshot.slice(PNG_PREFIX.length), "base64");
         if (bytes <= SCROLL_IMAGE_BYTES) {
           output.regions.push(panel);
+          captureProgress(page, 'panels', `Captured scrollable area ${Number(index) + 1}${panel.complete ? '.' : ' (partial).'}`, 'view');
           continue;
         }
         output.omitted = true;
@@ -799,13 +905,15 @@ async function captureScrollRegions(page: Page, until: number, output: ScrollCap
   }
 }
 
-async function createCaptureBrowser({ url, width, height, allowDevCertificate, crawl }: CaptureRequest, interactive: boolean) {
+async function createCaptureBrowser({ url, width, height, allowDevCertificate, crawl }: CaptureRequest, interactive: boolean, runtime?: CaptureRuntime) {
+  checkRuntime(runtime);
   const target = new URL(url);
   if (!["http:", "https:"].includes(target.protocol) || target.username || target.password) {
     throw new CaptureError(400, "Enter an HTTP or HTTPS URL without embedded credentials.");
   }
   const executablePath = browserExecutable();
-  const devCertificate = allowDevCertificate ? await readLocalCertificate(target) : undefined;
+  const devCertificate = allowDevCertificate ? await readLocalCertificate(target, runtime) : undefined;
+  checkRuntime(runtime);
   const proxy = await startCaptureProxy(target, devCertificate?.address);
   const viewport = { width, height };
   let browser: Browser | undefined;
@@ -820,8 +928,16 @@ async function createCaptureBrowser({ url, width, height, allowDevCertificate, c
     })();
     return closing;
   }
+  let rejectStartup: ((error: CaptureError) => void) | undefined;
+  const abortStartup = () => {
+    rejectStartup?.(cancelled());
+    void close().catch(() => {});
+  };
+  const startupCancelled = new Promise<never>((_resolve, reject) => { rejectStartup = reject; });
+  runtime?.signal?.addEventListener('abort', abortStartup, { once: true });
   try {
-    browser = await chromium.launch({
+    checkRuntime(runtime);
+    const launch = chromium.launch({
       executablePath,
       headless: !interactive,
       chromiumSandbox: true,
@@ -835,9 +951,17 @@ async function createCaptureBrowser({ url, width, height, allowDevCertificate, c
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-quic",
       ],
+    }).then(async launched => {
+      if (runtime?.signal?.aborted) {
+        await launched.close().catch(() => {});
+        throw cancelled();
+      }
+      return launched;
     }).catch(() => {
+      checkRuntime(runtime);
       throw new CaptureError(503, "The capture browser could not start. Check that Edge or Chrome opens on this computer.");
     });
+    browser = await Promise.race([launch, startupCancelled]);
     browser.once("disconnected", () => { void close().catch(() => {}); });
     const context = await browser.newContext({
       viewport,
@@ -862,6 +986,7 @@ async function createCaptureBrowser({ url, width, height, allowDevCertificate, c
       }
     });
     const page = await context.newPage();
+    checkRuntime(runtime);
     const connection = browser;
     function isOpen() {
       return !closing && connection.isConnected() && context.pages().length > 0;
@@ -880,14 +1005,19 @@ async function createCaptureBrowser({ url, width, height, allowDevCertificate, c
     return { page, context, target, viewport, devCertificateAllowed: Boolean(devCertificate), policy: proxy.policy, guardedCrawlPages, close, isOpen };
   } catch (error) {
     await close().catch(() => {});
+    checkRuntime(runtime);
     throw error;
+  } finally {
+    runtime?.signal?.removeEventListener('abort', abortStartup);
   }
 }
 
 type CaptureBrowser = Awaited<ReturnType<typeof createCaptureBrowser>>;
 
 async function navigateToTarget({ page, target, policy, devCertificateAllowed }: CaptureBrowser) {
+  captureProgress(page, 'loading', 'Opening the requested app.');
   const response = await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 18000 }).catch(error => {
+    checkCapture(page);
     if (policy.blockedTarget) {
       throw new CaptureError(400, "This address resolves to a private network. Use a public URL or the address of an app running on this computer.");
     }
@@ -979,6 +1109,7 @@ async function captureMainLayout(page: Page) {
 }
 
 async function captureMobileViews(page: Page, viewport: Dimensions, captureStartedAt: number, interactive: boolean, currentViewOnly = false): Promise<CaptureResult> {
+  checkCapture(page);
   const shots: ViewportShot[] = [];
   const warnings: string[] = [];
   const expectedUrl = page.url();
@@ -1016,6 +1147,7 @@ async function captureMobileViews(page: Page, viewport: Dimensions, captureStart
   try {
     if (!currentViewOnly) await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
     for (const handle of handles.values()) {
+      checkCapture(page);
       const element = handle.asElement() as ElementHandle<HTMLElement> | null;
       if (!element) continue;
       const initial = await element.evaluate(el => {
@@ -1033,13 +1165,20 @@ async function captureMobileViews(page: Page, viewport: Dimensions, captureStart
       let targetStep = 0;
       try {
         while (!stopped && shots.length < MOBILE_VIEW_LIMIT && Date.now() < until - 800) {
-          if (!currentViewOnly) await element.evaluate((el, { x, y }) => {
-            if (el === document.scrollingElement) window.scrollTo({ left: x, top: y, behavior: "instant" });
-            else el.scrollTo({ left: x, top: y, behavior: "instant" });
-          }, { x: nextX, y: nextY });
+          checkCapture(page);
+          if (!currentViewOnly) {
+            const moved = await element.evaluate((el, { x, y }) => {
+              const before = { x: el.scrollLeft, y: el.scrollTop };
+              if (el === document.scrollingElement) window.scrollTo({ left: x, top: y, behavior: "instant" });
+              else el.scrollTo({ left: x, top: y, behavior: "instant" });
+              return before.x !== el.scrollLeft || before.y !== el.scrollTop;
+            }, { x: nextX, y: nextY });
+            if (moved) contentReady.delete(page);
+          }
           try {
             await waitForContent(page, until - 250);
           } catch (error) {
+            checkCapture(page);
             if (!shots.length || !(error instanceof CaptureError) || error.code !== 'CONTENT_NOT_READY') throw error;
             warnings.push("The sequence stopped before a scroll view that was still loading.");
             stopped = true;
@@ -1082,6 +1221,7 @@ async function captureMobileViews(page: Page, viewport: Dimensions, captureStart
               })),
             });
             imageBytes += png.length;
+            captureProgress(page, 'scrolling', `Captured viewport ${shots.length} for this page.`, 'view');
           }
           if (currentViewOnly) break;
           const state = await element.evaluate(el => {
@@ -1115,6 +1255,7 @@ async function captureMobileViews(page: Page, viewport: Dimensions, captureStart
   }
 
   const first = shots[0];
+  checkCapture(page);
   if (!first) throw new CaptureError(413, "The mobile viewport could not be captured within the review limits.");
   if (limited) warnings.push("The viewport sequence reached a capture limit. It shows the scroll views captured so far.");
   return {
@@ -1126,12 +1267,16 @@ async function captureMobileViews(page: Page, viewport: Dimensions, captureStart
 }
 
 async function snapshot(page: Page, { viewport, policy }: CaptureBrowser, captureStartedAt: number, interactive: boolean, currentViewOnly = false): Promise<CaptureResult> {
+  captureProgress(page, 'loading', 'Waiting for page content and images.');
   await page.waitForLoadState("load", { timeout: 1800 }).catch(() => {});
   const deadline = captureStartedAt + CAPTURE_TIMEOUT - 1000;
   await waitForContent(page, deadline, true);
+  captureProgress(page, 'capturing', 'Page content is ready. Capturing the design.');
+  currentViewOnly ||= Boolean((await readNavigationState(page)).scopeSelector);
   if (viewport.width <= 600 || currentViewOnly) {
     const result = await captureMobileViews(page, viewport, captureStartedAt, interactive, currentViewOnly);
     if (policy.blocked) result.warnings.push("Some page requests were blocked because they targeted a private network.");
+    captureProgress(page, 'captured', 'Captured page and viewport sequence.', 'page');
     return result;
   }
   const reachedEnd = await warmPage(page, viewport, deadline);
@@ -1148,6 +1293,7 @@ async function snapshot(page: Page, { viewport, policy }: CaptureBrowser, captur
           height: reference.readUInt32BE(20),
           screenshot: `${PNG_PREFIX}${reference.toString("base64")}`,
         };
+        captureProgress(page, 'capturing', 'Captured the viewport reference.', 'view');
         await navigation.evaluate(state => state.apply());
         warnings.push("The viewport reference shows the pinned bottom navigation. The full-page view removes the overlay so it does not cover the content.");
       } else {
@@ -1155,6 +1301,7 @@ async function snapshot(page: Page, { viewport, policy }: CaptureBrowser, captur
       }
     }
     layout = await captureMainLayout(page);
+    captureProgress(page, 'capturing', 'Captured the page layout.', 'view');
   } finally {
     await navigation.evaluate(state => state.restore()).catch(() => {});
     await navigation.dispose().catch(() => {});
@@ -1170,9 +1317,13 @@ async function snapshot(page: Page, { viewport, policy }: CaptureBrowser, captur
   const scrollCapture: ScrollCapture = { regions: [], omitted: false, notices: [] };
   const until = Math.min(Date.now() + SCROLL_REGION_TIME, captureStartedAt + CAPTURE_TIMEOUT - 500);
   const scrollFinished = await Promise.race([
-    captureScrollRegions(page, until, scrollCapture).then(() => true, () => false),
+    captureScrollRegions(page, until, scrollCapture).then(() => true, () => {
+      checkCapture(page);
+      return false;
+    }),
     delay(Math.max(0, until - Date.now()), false, { ref: false }),
   ]);
+  checkCapture(page);
   if (!scrollFinished || scrollCapture.omitted) {
     warnings.push("Some scrollable areas could not be captured within the review limits.");
   }
@@ -1181,6 +1332,7 @@ async function snapshot(page: Page, { viewport, policy }: CaptureBrowser, captur
     if (!region.complete) warnings.push(`${region.label} is partial. ${region.partialReason || 'The panel reached a capture limit.'}`);
   }
   if (policy.blocked) warnings.push("Some page requests were blocked because they targeted a private network.");
+  captureProgress(page, 'captured', 'Captured page and structure map.', 'page');
   return {
     title,
     url: interactive ? finalUrl.origin : finalUrl.href,
@@ -1215,8 +1367,10 @@ function captureSize(result: CaptureResult) {
 }
 
 async function returnToSource(page: Page, sourceUrl: string, origin: string, timeout: number) {
+  checkCapture(page);
   if (crawlRoute(page.url(), origin) === sourceUrl) return;
   for (let index = 0; index < 6; index++) {
+    checkCapture(page);
     const before = page.url();
     await page.goBack({ waitUntil: 'domcontentloaded', timeout: Math.min(2500, timeout) }).catch(() => null);
     if (crawlRoute(page.url(), origin) === sourceUrl) return;
@@ -1226,6 +1380,7 @@ async function returnToSource(page: Page, sourceUrl: string, origin: string, tim
 }
 
 async function captureLinkedPages(page: Page, session: CaptureBrowser, root: CaptureResult, expiresAt: number, interactive: boolean) {
+  captureProgress(page, 'exploring', 'Discovering links and navigation controls.');
   const linkedPages: CaptureResult[] = [];
   const origin = new URL(root.url).origin;
   const entry = new URL(page.url());
@@ -1234,6 +1389,9 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
   }
   const seen = new Set<string>();
   const scheduled = new Set<string>();
+  const capturedModals = new Set<string>();
+  const initialState = await readNavigationState(page);
+  if (initialState.viewKey) capturedModals.add(initialState.viewKey);
   const queue: (NavigationTarget & { depth: number; steps: NavigationTarget[]; entryUrl: string })[] = [];
   const entryRoute = crawlRoute(entry.href, origin);
   if (entryRoute) {
@@ -1253,22 +1411,22 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
   let stopped = false;
 
   function skipControl(label: string, reason: string) {
+    captureProgress(page, 'skipped', 'Skipped a control that could not open a supported view.');
     controlsSkipped++;
     exploration.skipped.push({ label, reason });
   }
 
   async function discover(depth: number, steps: NavigationTarget[] = [], entryUrl = page.url()) {
+    checkCapture(page);
     for (const link of await discoverNavigation(page)) {
       const url = crawlRoute(link.url, origin);
       if (!url) {
         if (link.control) skipControl(link.label, 'The source address could not be replayed within this app.');
         continue;
       }
-      const trail = steps.map(step => {
-        const label = step.label.replace(/\s*[([]\s*\d+\s*[)\]]\s*$/, '').trim();
-        return `${step.control?.selector}:${label}`;
-      }).join('>');
-      const key = link.control ? `${url}|${trail}|${link.key}` : url;
+      // The source state identifies the control. Different replay trails to
+      // that same state must not enqueue the same interaction repeatedly.
+      const key = link.control ? `${url}|${link.key}` : url;
       if (scheduled.has(key) || seen.has(key)) continue;
       if (depth > CRAWL_DEPTH_LIMIT || scheduled.size >= CRAWL_LINK_LIMIT) {
         limited = true;
@@ -1279,7 +1437,8 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
       else exploration.linksFound++;
       queue.push({ ...link, url, key, depth, steps: link.control ? steps : [], entryUrl: link.control && steps.length ? entryUrl : url });
     }
-    queue.sort((a, b) => a.priority - b.priority || a.depth - b.depth);
+    queue.sort((a, b) => Number(Boolean(a.control)) - Number(Boolean(b.control)) || a.priority - b.priority || a.depth - b.depth);
+    captureProgress(page, 'exploring', `Found ${exploration.linksFound} links and ${exploration.controlsFound} navigation controls.`);
   }
 
   try {
@@ -1320,6 +1479,7 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
         session.guardedCrawlPages.add(page);
 
         while (queue.length && !stopped) {
+          checkCapture(page);
           const remaining = expiresAt - Date.now();
           if (linkedPages.length + 1 >= CRAWL_PAGE_LIMIT || attempts >= CRAWL_ATTEMPT_LIMIT || bytes >= CRAWL_IMAGE_BYTES || remaining < 1000) {
             limited = true;
@@ -1333,36 +1493,43 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
             continue;
           }
           attempts++;
+          captureProgress(page, 'exploring', `Exploring ${link.control ? 'navigation control' : 'linked page'} ${attempts}; ${queue.length} remaining.`);
           try {
             await withinCaptureBudget(async startedAt => {
               probing = false;
               const navigationTimeout = Math.min(9000, remaining);
               let response: Awaited<ReturnType<Page['goto']>> = null;
               let stepsToReplay = link.steps;
+              let sourceAlreadyReady = false;
               if (link.control) {
                 const selector = link.control.selector;
                 const sameSource = crawlRoute(page.url(), origin) === link.url;
-                if (sameSource) {
-                  const obscuredByDialog = await page.evaluate(selector => {
-                    const target = document.querySelector(selector);
-                    return Array.from(document.querySelectorAll('dialog[open], [role=dialog][aria-modal=true]'))
-                      .some(dialog => dialog.checkVisibility({ visibilityProperty: true }) && (!target || !dialog.contains(target)));
-                  }, selector);
-                  if (obscuredByDialog) {
-                    probing = true;
-                    await page.keyboard.press('Escape');
+                const sameView = sameSource && (await readNavigationState(page)).key === link.sourceKey;
+                const availableHere = sameView && await page.locator(selector).count() === 1 &&
+                  await page.locator(selector).isVisible();
+                if (availableHere) {
+                  stepsToReplay = [];
+                  sourceAlreadyReady = true;
+                }
+                else {
+                  // A matching URL/selector does not imply the same SPA view.
+                  // Restore the entry screen before replaying the saved trail.
+                  if (link.steps.length) {
+                    response = await page.goto(link.entryUrl, { waitUntil: 'domcontentloaded', timeout: navigationTimeout });
+                  } else {
+                    await returnToSource(page, link.entryUrl, origin, navigationTimeout);
+                    if ((await readNavigationState(page)).key !== link.sourceKey) {
+                      response = await page.goto(link.entryUrl, { waitUntil: 'domcontentloaded', timeout: navigationTimeout });
+                    }
                   }
                 }
-                const availableHere = sameSource && await page.locator(selector).count() === 1 &&
-                  await page.locator(selector).isVisible();
-                if (availableHere) stepsToReplay = [];
-                else await returnToSource(page, link.entryUrl, origin, navigationTimeout);
               } else {
                 response = await page.goto(link.url, { waitUntil: "domcontentloaded", timeout: navigationTimeout });
               }
               let url = crawlRoute(page.url(), origin);
               if (!url || (response && response.status() >= 400)) {
                 skipped++;
+                captureProgress(page, 'skipped', 'Skipped a linked page that did not finish opening.');
                 return;
               }
               let viewKey = url;
@@ -1371,10 +1538,11 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
               if (link.control) {
                 controlsTried++;
                 seen.add(link.key);
-                await waitForContent(page, startedAt + CAPTURE_TIMEOUT - 1500, true);
+                await waitForContent(page, startedAt + CAPTURE_TIMEOUT - 1500, !sourceAlreadyReady);
                 blockedProbeRequest = false;
                 probing = true;
                 for (const step of stepsToReplay) {
+                  checkCapture(page);
                   const replay = await probeNavigation(page, step);
                   if (replay.blocked || blockedProbeRequest || !replay.changed) {
                     skipControl(link.label, replay.reason || 'A preceding navigation step could not be reopened.');
@@ -1388,6 +1556,7 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
                   return;
                 }
                 const outcome = await probeNavigation(page, link);
+                checkCapture(page);
                 if (outcome.clicked) exploration.controlsClicked++;
                 const destination = crawlRoute(outcome.popupUrl || outcome.url, origin);
                 if (!destination) {
@@ -1396,6 +1565,10 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
                 }
                 if (destination !== url) {
                   probing = false;
+                  if (seen.has(destination)) {
+                    captureProgress(page, 'skipped', 'This destination was already captured.');
+                    return;
+                  }
                   const destinationResponse = outcome.popupUrl
                     ? await page.goto(destination, { waitUntil: 'domcontentloaded', timeout: navigationTimeout }) : null;
                   url = crawlRoute(page.url(), origin);
@@ -1411,7 +1584,7 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
                       ? 'The control required a data-changing request.' : 'The click did not open another screen.'));
                     return;
                   }
-                  viewKey = link.key;
+                  viewKey = `state:${(await readNavigationState(page)).key}`;
                   nextSteps = [...link.steps, link];
                   currentViewOnly = link.control.kind === 'disclosure' || await page.evaluate(() =>
                     Array.from(document.querySelectorAll('dialog[open], [role=dialog][aria-modal=true]'))
@@ -1421,6 +1594,11 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
               if (!link.control && seen.has(viewKey)) return;
               if (link.control && viewKey !== link.key && seen.has(viewKey)) return;
               seen.add(viewKey);
+              const beforeSnapshot = await readNavigationState(page);
+              if (beforeSnapshot.viewKey && capturedModals.has(beforeSnapshot.viewKey)) {
+                captureProgress(page, 'skipped', 'This dialog was already captured from another page.');
+                return;
+              }
               const result = await snapshot(page, session, startedAt, interactive, currentViewOnly);
               if (stopped) return;
               if (crawlRoute(page.url(), origin) !== url) {
@@ -1434,11 +1612,14 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
                 return;
               }
               bytes += pageBytes;
+              const capturedState = await readNavigationState(page);
+              if (capturedState.viewKey) capturedModals.add(capturedState.viewKey);
               linkedPages.push({ ...result, navigationLabel: link.label || undefined });
               exploration.viewsCaptured = linkedPages.length + 1;
               await discover(link.depth + 1, nextSteps, nextSteps.length ? link.entryUrl : page.url());
             }, Math.min(CAPTURE_TIMEOUT, remaining));
           } catch (error) {
+            checkCapture(page);
             if (error instanceof CaptureError && error.code === 'CONTENT_NOT_READY') {
               loadingSkipped.push(link.label || 'A linked page');
             }
@@ -1459,6 +1640,7 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
       }
     }, Math.max(1, expiresAt - Date.now()));
   } catch {
+    checkCapture(page);
     stopped = true;
     limited = true;
   }
@@ -1469,20 +1651,34 @@ async function captureLinkedPages(page: Page, session: CaptureBrowser, root: Cap
   for (const label of loadingSkipped) warnings.push(`${label} was still loading and was skipped.`);
   if (controlsSkipped) warnings.push(`${controlsSkipped} navigation controls were skipped because they did not open a supported view or required a blocked action.`);
   if (limited) warnings.push("The linked-page capture reached a safety or size limit. The review contains the pages captured so far.");
+  captureProgress(page, 'exploring', 'Navigation exploration finished.');
   return { ...root, linkedPages: linkedPages.slice(), warnings, exploration };
 }
 
-export async function capturePage(input: CaptureRequest): Promise<CaptureResult> {
-  const session = await createCaptureBrowser(input, false);
+export async function capturePage(input: CaptureRequest, runtime?: CaptureRuntime): Promise<CaptureResult> {
+  checkRuntime(runtime);
+  notifyRuntime(runtime, { phase: 'starting', message: 'Starting the capture browser.', pagesCaptured: 0, viewsCaptured: 0 });
+  const session = await createCaptureBrowser(input, false, runtime);
+  const release = bindRuntime(session, runtime);
   const expiresAt = Date.now() + CRAWL_TIMEOUT;
   try {
     const root = await withinCaptureBudget(async startedAt => {
       await navigateToTarget(session);
       return snapshot(session.page, session, startedAt, false);
     });
-    return input.crawl ? await captureLinkedPages(session.page, session, root, expiresAt, false) : root;
+    const result = input.crawl ? await captureLinkedPages(session.page, session, root, expiresAt, false) : root;
+    captureProgress(session.page, 'completed', 'Capture finished. Preparing the review.');
+    return result;
+  } catch (error) {
+    checkRuntime(runtime);
+    throw error;
   } finally {
-    await session.close();
+    try {
+      await session.close();
+    } finally {
+      release();
+    }
+    checkRuntime(runtime);
   }
 }
 
@@ -1507,30 +1703,42 @@ async function selectedWebsiteTab(context: BrowserContext, target: URL) {
     ?? pages[0];
 }
 
-export async function openCaptureSession(input: CaptureRequest): Promise<InteractiveCapture> {
-  const session = await createCaptureBrowser(input, true);
+export async function openCaptureSession(input: CaptureRequest, runtime?: CaptureRuntime): Promise<InteractiveCapture> {
+  checkRuntime(runtime);
+  notifyRuntime(runtime, { phase: 'starting', message: 'Opening the sign-in browser.', pagesCaptured: 0, viewsCaptured: 0 });
+  const session = await createCaptureBrowser(input, true, runtime);
   // Chromium displays the initial page or its network error, while the API returns promptly.
   void session.page.goto(session.target.href, { waitUntil: "commit", timeout: 18000 }).catch(() => {});
+  notifyRuntime(runtime, { phase: 'signin', message: 'Sign-in browser is ready.' });
   return {
     isOpen: session.isOpen,
     close: session.close,
-    async capture() {
+    async capture(runtime?: CaptureRuntime) {
+      checkRuntime(runtime);
+      const release = bindRuntime(session, runtime);
       const closed = () => new CaptureError(410, "The sign-in browser was closed. Open a new sign-in capture to try again.");
-      if (!session.isOpen()) throw closed();
-      const page = await selectedWebsiteTab(session.context, session.target);
-      if (!session.isOpen()) throw closed();
-      if (!page) throw new CaptureError(409, "The sign-in browser has no website tab ready to capture. Wait for the website to load before capturing.");
       try {
+        captureProgress(session.page, 'starting', 'Preparing to capture the signed-in app.');
+        if (!session.isOpen()) throw closed();
+        const page = await selectedWebsiteTab(session.context, session.target);
+        checkRuntime(runtime);
+        if (!session.isOpen()) throw closed();
+        if (!page) throw new CaptureError(409, "The sign-in browser has no website tab ready to capture. Wait for the website to load before capturing.");
         const expiresAt = Date.now() + CRAWL_TIMEOUT;
         const root = await withinCaptureBudget(startedAt => snapshot(page, session, startedAt, true));
-        return input.crawl ? await captureLinkedPages(page, session, root, expiresAt, true) : root;
+        const result = input.crawl ? await captureLinkedPages(page, session, root, expiresAt, true) : root;
+        captureProgress(page, 'completed', 'Capture finished. Preparing the review.');
+        return result;
       } catch (error) {
+        checkRuntime(runtime);
         if (!session.isOpen()) throw closed();
         if (error instanceof CaptureError) throw error;
         if (error instanceof Error && /execution context was destroyed|cannot find context|frame was detached/i.test(error.message)) {
           throw new CaptureError(409, "The page is still navigating. Wait for it to finish loading, then capture again.");
         }
         throw new CaptureError(422, "The signed-in page could not be captured. Try a new sign-in capture.");
+      } finally {
+        release();
       }
     },
   };

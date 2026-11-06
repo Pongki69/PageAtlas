@@ -1,10 +1,12 @@
 import type { Page } from "playwright-core";
+import { readNavigationState } from './navigation-state.ts';
 
 export type NavigationTarget = {
   url: string;
   label: string;
   priority: number;
   key: string;
+  sourceKey?: string;
   control?: { selector: string; kind: "navigate" | "disclosure" | "tab" };
 };
 
@@ -88,7 +90,8 @@ export function navigationUrl(value: string, origin: string): string | undefined
 export async function discoverNavigation(page: Page): Promise<NavigationTarget[]> {
   const sourceUrl = page.url();
   const origin = new URL(sourceUrl).origin;
-  const candidates = await page.evaluate(() => {
+  const state = await readNavigationState(page);
+  const candidates = await page.evaluate(({ scopeSelector }) => {
     type Candidate = {
       url?: string;
       label: string;
@@ -96,6 +99,8 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
       control?: { selector: string; kind: "navigate" | "disclosure" | "tab" };
     };
     const results: Candidate[] = [];
+    const scope = scopeSelector ? document.querySelector(scopeSelector) : document;
+    if (!scope) return results;
     const navigationContext = "aside, nav, [role=navigation], [role=complementary], [role=menu], [role=menubar], [role=tablist]";
     const unsafeLabel = /\b(?:delete|remove|destroy|save|submit|send|confirm|checkout|purchase|buy|pay|approve|reject|refund|revoke|unsubscribe|sign\s*out|log\s*out|logout|discard|reset|cancel|download|export|print)\b/i;
     function labelOf(element: Element) {
@@ -106,12 +111,13 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
         .map(value => value?.trim().replace(/\s+/g, " ")).find(Boolean)?.slice(0, 140) || "";
     }
     function priorityOf(element: Element) {
+      if (scopeSelector) return -2;
       if (element.closest("aside, [role=complementary]")) return 0;
       return element.closest(navigationContext) ? 1 : 2;
     }
     function excluded(element: Element) {
       const method = element.getAttribute("data-method") || element.getAttribute("data-turbo-method");
-      return element.matches('[disabled], [aria-disabled=true], [download], [data-confirm], [rel~=external], [type=submit], [type=reset], [form]') ||
+      return element.matches('base, link, [disabled], [aria-disabled=true], [download], [data-confirm], [rel~=external], [type=submit], [type=reset], [form]') ||
         Boolean(method && method.toLowerCase() !== "get") || Boolean(element.closest("form, [inert]"));
     }
     function selectorOf(element: Element) {
@@ -137,19 +143,16 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
       }
       return parts.join(" > ");
     }
-    const elements = document.querySelectorAll<HTMLElement>(
-      'a[href], [data-href], [data-url], [data-to], [data-route], button, input[type=button], [role=button], [role=link], [role=tab], [role=menuitem]',
+    const elements = scope.querySelectorAll<Element>(
+      '[href], [data-href], [data-url], [data-to], [data-route], button, input[type=button], [role=button], [role=link], [role=tab], [role=menuitem]',
     );
     for (const element of Array.from(elements).slice(0, 2000)) {
       if (excluded(element)) continue;
       const label = labelOf(element);
       const priority = priorityOf(element);
       const inNavigation = Boolean(element.closest(navigationContext));
-      const visible = element.checkVisibility({ opacityProperty: true, visibilityProperty: true }) &&
-        element.getBoundingClientRect().width > 0 && element.getBoundingClientRect().height > 0;
-      if (!visible && !inNavigation) continue;
       const href = element.getAttribute("href")?.trim();
-      const destination = element instanceof HTMLAnchorElement && href && href !== "#" ? element.href
+      const destination = href && href !== "#" ? href
         : ["data-href", "data-url", "data-to", "data-route"].map(attribute => element.getAttribute(attribute)).find(Boolean);
       if (destination) {
         if (/^(?:delete|remove|save|submit|send|confirm|approve|reject|revoke|reset|cancel|download|export|print)\b/i.test(label)) continue;
@@ -160,6 +163,10 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
         }
         continue;
       }
+      // URLs can be followed directly even when their links are in a collapsed
+      // menu or another responsive layout. Visibility only limits click probes.
+      const visible = element.checkVisibility({ opacityProperty: true, visibilityProperty: true }) &&
+        element.getBoundingClientRect().width > 0 && element.getBoundingClientRect().height > 0;
       if (!visible || !label || unsafeLabel.test(label) || /^(?:close|dismiss|collapse)\b/i.test(label)) continue;
       const role = element.getAttribute("role");
       const nativeButton = element instanceof HTMLButtonElement ||
@@ -173,12 +180,12 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
       results.push({ label, priority, control: { selector, kind } });
     }
     return results;
-  });
+  }, state);
   const targets = new Map<string, NavigationTarget>();
   for (const candidate of candidates) {
     if (candidate.control) {
-      const key = `control:${candidate.control.kind}:${candidate.control.selector}:${controlLabelKey(candidate.label)}`;
-      targets.set(key, { ...candidate, url: sourceUrl, key });
+      const key = `control:${state.key}:${candidate.control.kind}:${candidate.control.selector}:${controlLabelKey(candidate.label)}`;
+      targets.set(key, { ...candidate, url: sourceUrl, key, sourceKey: state.key });
       continue;
     }
     const url = candidate.url && navigationUrl(candidate.url, origin);
@@ -186,5 +193,5 @@ export async function discoverNavigation(page: Page): Promise<NavigationTarget[]
     const existing = targets.get(url);
     if (!existing || candidate.priority < existing.priority) targets.set(url, { ...candidate, url, key: url });
   }
-  return [...targets.values()].sort((a, b) => a.priority - b.priority);
+  return [...targets.values()].sort((a, b) => a.priority - b.priority || Number(Boolean(a.control)) - Number(Boolean(b.control)));
 }
