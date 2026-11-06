@@ -1615,3 +1615,22 @@ button:not(:disabled), label:has(input:not(:disabled)) {
   .workspace-toolbar,.page-picker,.capture-gallery { padding: 16px; }
   .main-content .intro { margin-bottom: 28px; }
 }
+
+/* Shown when the app is hosted without the capture server. */
+.local-only { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: clamp(28px, 5vw, 80px); align-items: center; margin-top: 8px; padding: clamp(28px, 4vw, 56px); border: 1px solid var(--accent-line); border-radius: 22px; background: linear-gradient(120deg, var(--accent-soft), var(--panel) 65%); }
+.local-only-icon { display: inline-grid; place-items: center; width: 52px; height: 52px; border: 1px solid var(--accent-line); border-radius: 14px; background: var(--accent-soft); color: var(--accent); }
+.local-only-copy h2 { margin-top: 22px; font-size: clamp(1.5rem, 2.4vw, 2.2rem); font-weight: 700; letter-spacing: -.035em; line-height: 1.25; }
+.local-only-copy > p { max-width: 50ch; margin-top: 14px; color: var(--muted); line-height: 1.85; }
+.local-only-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+.local-only-actions a { display: inline-flex; align-items: center; justify-content: center; gap: 10px; text-decoration: none; }
+.local-only-steps { display: grid; gap: 12px; list-style: none; }
+.local-only-steps li { display: flex; align-items: start; gap: 16px; padding: 20px 22px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+.local-only-steps li > span { display: grid; flex: none; place-items: center; width: 34px; height: 34px; border: 1px solid var(--accent-line); border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: .8rem; font-weight: 700; }
+.local-only-steps strong { font-size: .95rem; font-weight: 650; }
+.local-only-steps p { margin-top: 5px; color: var(--muted); font-size: .86rem; line-height: 1.75; }
+.local-only-steps code { padding: 1px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--field); color: var(--text); font-size: .8rem; }
+@media (max-width: 939px) { .local-only { grid-template-columns: minmax(0, 1fr); } }
+
+/* Replaces the sign-in option when the online version can't open sign-in windows. */
+.capture-options .capture-option .capture-option-title { display: flex; align-items: center; min-height: 32px; margin-top: 0; color: var(--text); font-size: .83rem; font-weight: 650; }
+.capture-option a { color: var(--accent); text-underline-offset: 3px; }

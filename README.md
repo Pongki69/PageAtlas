@@ -56,3 +56,13 @@ Desktop and tablet panels share a 25-second capture allowance, up to 96 tiles, a
 3. Navigate to the page you want and leave that tab active. Return to PageAtlas and select **Capture signed-in page**.
 
 The temporary browser closes after a capture, cancellation, or 10 minutes of waiting. PageAtlas uses that browser's session for the capture. The exported source shows the site's origin so the page path and URL parameters stay out of the review metadata. Screenshots, headings, and exported files can contain visible account information.
+
+## Host it online
+
+The online version runs the capture server on [Render](https://render.com)'s free plan and serves the site from Vercel. Visitors stay anonymous. A cookie keeps each visitor's captures and reviews private to their browser, and reviews are deleted after 15 minutes. The online version captures public websites only: sign-in capture, local development certificates and addresses on private networks are turned off.
+
+1. On Render, choose **New → Blueprint** and select this repository. Render reads [render.yaml](render.yaml) and builds the [Dockerfile](Dockerfile).
+2. When Render asks for `PAGEATLAS_ALLOWED_ORIGINS`, enter your Vercel address, such as `https://pageatlas.vercel.app`.
+3. Check that the service address in [vercel.json](vercel.json) matches your Render service (`https://pageatlas.onrender.com` by default), then redeploy on Vercel.
+
+Render's free plan has about 512 MB of memory and sleeps after 15 minutes without traffic, so the first visit after a quiet period takes about a minute to wake up. The blueprint runs one capture at a time (later captures wait in line), allows 10 captures per visitor per hour, and explores up to 8 linked views. Change these with the `PAGEATLAS_*` settings in `render.yaml`. To also limit captures per network address, set `PAGEATLAS_PROXY_HOPS` to the number of proxies that add to `X-Forwarded-For`. Check the header first: with the wrong count, all visitors share one limit.

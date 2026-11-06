@@ -108,7 +108,18 @@ const MAX_VIEWPORT_IMAGE_BYTES = 4 * 1024 * 1024;
 const MOBILE_VIEW_LIMIT = 30;
 const CAPTURE_TIMEOUT = 60000;
 const CRAWL_TIMEOUT = 180000;
-const CRAWL_PAGE_LIMIT = 30;
+/** Hosted servers run PageAtlas for anonymous visitors; they never capture addresses on the server itself. */
+const HOSTED = process.env.PAGEATLAS_HOSTED === "1";
+const CRAWL_PAGE_LIMIT = (() => {
+  const configured = Number(process.env.PAGEATLAS_CRAWL_LIMIT);
+  return Number.isInteger(configured) && configured >= 1 && configured <= 30 ? configured : 30;
+})();
+/** Chromium's sandbox needs kernel features that some containers lack; the container then provides the isolation. */
+const CHROMIUM_SANDBOX = process.env.PAGEATLAS_CHROMIUM_SANDBOX !== "0";
+
+export function crawlPageLimit() {
+  return CRAWL_PAGE_LIMIT;
+}
 const CRAWL_DEPTH_LIMIT = 3;
 const CRAWL_ATTEMPT_LIMIT = 90;
 const CRAWL_LINK_LIMIT = 240;
@@ -277,9 +288,14 @@ async function startCaptureProxy(target: URL, pinnedLocalAddress?: string) {
   const targetPort = Number(target.port || (target.protocol === "https:" ? 443 : 80));
   const assigned = assignedAddresses();
   const localTarget = isLocalHost(targetHost, assigned);
+  if (HOSTED && localTarget) {
+    throw new CaptureError(400, "The online version of PageAtlas captures public websites only.");
+  }
   let localTargetAllowed = localTarget;
   if (!localTargetAllowed && isIP(targetHost) && !isPublicAddress(targetHost)) {
-    throw new CaptureError(400, "This private address is not assigned to this computer. Use a public URL or an app running on this computer.");
+    throw new CaptureError(400, HOSTED
+      ? "The online version of PageAtlas captures public websites only. This address is on a private network."
+      : "This private address is not assigned to this computer. Use a public URL or an app running on this computer.");
   }
 
   const resolutions = new Map<string, Promise<LookupAddress[]>>();
@@ -940,7 +956,7 @@ async function createCaptureBrowser({ url, width, height, allowDevCertificate, c
     const launch = chromium.launch({
       executablePath,
       headless: !interactive,
-      chromiumSandbox: true,
+      chromiumSandbox: CHROMIUM_SANDBOX,
       ...(interactive && { ignoreDefaultArgs: ["--disable-client-side-phishing-detection"] }),
       timeout: 12000,
       args: [
@@ -950,6 +966,8 @@ async function createCaptureBrowser({ url, width, height, allowDevCertificate, c
         "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--disable-quic",
+        // Containers often have a tiny /dev/shm, which crashes Chromium tabs on large pages.
+        ...(HOSTED ? ["--disable-dev-shm-usage", "--renderer-process-limit=2"] : []),
       ],
     }).then(async launched => {
       if (runtime?.signal?.aborted) {
@@ -1019,7 +1037,9 @@ async function navigateToTarget({ page, target, policy, devCertificateAllowed }:
   const response = await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 18000 }).catch(error => {
     checkCapture(page);
     if (policy.blockedTarget) {
-      throw new CaptureError(400, "This address resolves to a private network. Use a public URL or the address of an app running on this computer.");
+      throw new CaptureError(400, HOSTED
+        ? "This address resolves to a private network. The online version of PageAtlas captures public websites only."
+        : "This address resolves to a private network. Use a public URL or the address of an app running on this computer.");
     }
     if (error instanceof errors.TimeoutError) {
       throw new CaptureError(504, "The page took too long to load. Check the URL and try again.");

@@ -122,11 +122,66 @@ function jobIsActive(job: CaptureJob | null) {
   return job?.status === 'running' || job?.status === 'cancelling'
 }
 
+const repositoryUrl = 'https://github.com/Pongki69/PageAtlas'
+
+/** Thrown when the page is served without the PageAtlas capture server, such as a static hosting deployment. */
+class CaptureServerMissingError extends Error {}
+
 async function currentCaptureJob(signal?: AbortSignal): Promise<CaptureJob | null> {
   const response = await fetch('/api/capture-job', { cache: 'no-store', signal })
+  // The capture server always answers its API with JSON. A static host without it answers 404 with a page;
+  // a proxy in front of a server that is still starting answers with a gateway error instead.
+  if (!(response.headers.get('content-type') ?? '').includes('application/json')) {
+    if (response.status === 404) throw new CaptureServerMissingError('PageAtlas capture server is not available.')
+    throw new Error('The capture server is starting.')
+  }
   if (!response.ok) throw new Error((await responseFailure(response, 'Couldn’t check the current capture.')).message)
   const result: { job: CaptureJob | null } = await response.json()
   return result.job
+}
+
+type ServerInfo = { hosted: boolean; signIn: boolean; devCertificate: boolean; crawlPageLimit: number; hourlyCaptureLimit?: number; reviewMinutes?: number }
+
+const localServer: ServerInfo = { hosted: false, signIn: true, devCertificate: true, crawlPageLimit: 30 }
+
+async function fetchServerInfo(signal?: AbortSignal): Promise<ServerInfo> {
+  const response = await fetch('/api/server-info', { cache: 'no-store', signal })
+  if (!response.ok || !(response.headers.get('content-type') ?? '').includes('application/json')) return localServer
+  const info: Partial<ServerInfo> = await response.json()
+  return {
+    hosted: info.hosted === true,
+    signIn: info.signIn !== false,
+    devCertificate: info.devCertificate !== false,
+    crawlPageLimit: typeof info.crawlPageLimit === 'number' ? info.crawlPageLimit : 30,
+    hourlyCaptureLimit: info.hourlyCaptureLimit,
+    reviewMinutes: info.reviewMinutes,
+  }
+}
+
+function LocalOnlyNotice() {
+  return <>
+    <section className="intro" aria-labelledby="intro-heading">
+      <p className="eyebrow"><Focus size={15} aria-hidden="true" /> Capture workspace</p>
+      <h1 id="intro-heading">Capture runs on your computer<span>.</span></h1>
+      <p>This online version is a preview. PageAtlas opens a real browser to take screenshots, so the capture workspace runs on your own computer.</p>
+    </section>
+    <section className="local-only" aria-labelledby="local-only-heading">
+      <div className="local-only-copy">
+        <span className="local-only-icon"><Monitor size={24} aria-hidden="true" /></span>
+        <h2 id="local-only-heading">Run PageAtlas locally</h2>
+        <p>It takes a few minutes to set up. Captures and reviews stay on your computer, and you can still capture sites that need a sign-in.</p>
+        <div className="local-only-actions">
+          <a className="capture-button" href={repositoryUrl} target="_blank" rel="noopener noreferrer">Get PageAtlas on GitHub <ExternalLink size={17} aria-hidden="true" /><span className="sr-only"> (opens in a new tab)</span></a>
+          <a className="export-button" href="#home">Back to home</a>
+        </div>
+      </div>
+      <ol className="local-only-steps">
+        <li><span>1</span><div><strong>Install the essentials</strong><p>Node.js 22.18 or newer, plus Microsoft Edge or Google Chrome.</p></div></li>
+        <li><span>2</span><div><strong>Download PageAtlas</strong><p>Clone the repository or download it as a ZIP from GitHub and extract it.</p></div></li>
+        <li><span>3</span><div><strong>Start it</strong><p>On Windows, double-click <code>Start PageAtlas.bat</code>. Or run <code>npm ci</code>, <code>npm run build</code>, and <code>npm start</code>, then open <code>http://127.0.0.1:4317</code>.</p></div></li>
+      </ol>
+    </section>
+  </>
 }
 
 function initialTheme(): Theme {
@@ -526,6 +581,8 @@ export default function App() {
   const [jobSyncing, setJobSyncing] = useState(true)
   const [jobsSynced, setJobsSynced] = useState(false)
   const [jobConnectionError, setJobConnectionError] = useState('')
+  const [captureServerMissing, setCaptureServerMissing] = useState(false)
+  const [serverInfo, setServerInfo] = useState<ServerInfo>(localServer)
   const [stopping, setStopping] = useState(false)
   const [reviewAction, setReviewAction] = useState<'export' | 'pdf' | 'delete' | null>(null)
   const [viewerPageId, setViewerPageId] = useState<string | null>(null)
@@ -540,7 +597,7 @@ export default function App() {
   const screenshotRef = useRef<HTMLDivElement>(null)
   const activeJob = jobIsActive(job)
   const pending = activity !== null || activeJob || jobSyncing || !jobsSynced || reviewAction !== null
-  const developmentOrigin = developmentCertificateOrigin(normalizeUrl(url))
+  const developmentOrigin = serverInfo.devCertificate ? developmentCertificateOrigin(normalizeUrl(url)) : null
   const capturedPages = review ? [review, ...(review.linkedPages ?? [])] : []
   const currentPage = capturedPages.find((page) => page.id === selectedPageId) ?? review
   const viewportShots = currentPage?.viewportShots ?? []
@@ -584,14 +641,26 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController()
+    void fetchServerInfo(controller.signal).then(info => {
+      setServerInfo(info)
+      if (!info.signIn) setSignIn(false)
+      if (!info.devCertificate) setAllowDevCertificate(false)
+    }).catch(() => {})
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
     let disposed = false
     void currentCaptureJob(controller.signal).then(current => {
       if (disposed) return
       applyCaptureJob(current)
       setJobsSynced(true)
       setJobConnectionError('')
-    }).catch(() => {
-      if (!disposed) setJobConnectionError('Couldn’t check the current capture. Reconnect before starting another capture.')
+    }).catch(failure => {
+      if (disposed) return
+      if (failure instanceof CaptureServerMissingError) setCaptureServerMissing(true)
+      else setJobConnectionError('Couldn’t reach the capture service. If it was idle, it can take about a minute to start. Reconnect to try again.')
     }).finally(() => {
       if (!disposed) setJobSyncing(false)
     })
@@ -750,8 +819,11 @@ export default function App() {
       applyCaptureJob(await currentCaptureJob())
       setJobsSynced(true)
       setJobConnectionError('')
-    } catch {
-      setJobConnectionError('Couldn’t reconnect. Check that PageAtlas is running and try again.')
+    } catch (failure) {
+      if (failure instanceof CaptureServerMissingError) {
+        setCaptureServerMissing(true)
+        setJobConnectionError('')
+      } else setJobConnectionError('Couldn’t reconnect. The capture service may still be starting, or PageAtlas isn’t running. Try again in a moment.')
     } finally {
       setJobSyncing(false)
     }
@@ -940,7 +1012,7 @@ export default function App() {
       </header>
 
       <main className={`page-container ${screen === 'home' ? 'landing-main' : 'main-content'}`} id="main-content">
-        {screen === 'home' ? <Suspense fallback={<p className="landing-loading" role="status">Loading PageAtlas…</p>}><HomePage /></Suspense> : <>
+        {screen === 'home' ? <Suspense fallback={<p className="landing-loading" role="status">Loading PageAtlas…</p>}><HomePage /></Suspense> : captureServerMissing ? <LocalOnlyNotice /> : <>
         <section className="intro" aria-labelledby="intro-heading">
           <p className="eyebrow"><Focus size={15} aria-hidden="true" /> Capture workspace</p>
           <h1 id="intro-heading">Capture your next page<span>.</span></h1>
@@ -1025,18 +1097,25 @@ export default function App() {
                   }} />
                   <span>Capture linked pages</span>
                 </label>
-                <p id="linked-pages-help">Click navigation buttons and explore links, tabs, and menus. Up to 30 views can take a few minutes.</p>
+                <p id="linked-pages-help">Click navigation buttons and explore links, tabs, and menus. Up to {serverInfo.crawlPageLimit} views can take a few minutes.</p>
               </div>
-              <div className="capture-option">
-                <label>
-                  <input type="checkbox" checked={signIn} disabled={pending} aria-describedby="sign-in-help" onChange={event => {
-                    clearCertificateRetry()
-                    setSignIn(event.currentTarget.checked)
-                  }} />
-                  <span>Sign in, then capture</span>
-                </label>
-                <p id="sign-in-help">For pages that require an account.</p>
-              </div>
+              {serverInfo.signIn ? (
+                <div className="capture-option">
+                  <label>
+                    <input type="checkbox" checked={signIn} disabled={pending} aria-describedby="sign-in-help" onChange={event => {
+                      clearCertificateRetry()
+                      setSignIn(event.currentTarget.checked)
+                    }} />
+                    <span>Sign in, then capture</span>
+                  </label>
+                  <p id="sign-in-help">For pages that require an account.</p>
+                </div>
+              ) : (
+                <div className="capture-option">
+                  <p className="capture-option-title">Pages behind a sign-in</p>
+                  <p>The online version captures public pages only. <a href={repositoryUrl} target="_blank" rel="noopener noreferrer">Run PageAtlas on your computer<span className="sr-only"> (opens in a new tab)</span></a> to capture pages that need an account.</p>
+                </div>
+              )}
               {developmentOrigin && (
                 <div className="capture-option">
                   <label>
@@ -1056,7 +1135,9 @@ export default function App() {
         )}
 
         <div className="capture-status">
-          <p id="capture-hint"><LockKeyhole size={14} aria-hidden="true" /> Captures run on this computer.</p>
+          <p id="capture-hint"><LockKeyhole size={14} aria-hidden="true" /> {serverInfo.hosted
+            ? `Captures run on a shared PageAtlas server. Only this browser can see your review, and it’s deleted after ${serverInfo.reviewMinutes ?? 15} minutes.`
+            : 'Captures run on this computer.'}</p>
           <p className="state-status" role="status">
             {progress || (sessionId ? 'Waiting for sign-in' : status && <><Check size={16} aria-hidden="true" /> {status}</>)}
           </p>

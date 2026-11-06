@@ -1,0 +1,9 @@
+node_modules
+dist
+output
+.git
+.vercel
+*.log
+.env
+.env.*
+Start PageAtlas.bat

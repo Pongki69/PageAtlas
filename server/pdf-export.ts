@@ -29,7 +29,10 @@ export function capturePdfDocument(review: CaptureResult) {
 }
 
 export async function renderCapturePdf(review: CaptureResult): Promise<Buffer> {
-  const browser = await chromium.launch({ executablePath: browserExecutable(), headless: true, timeout: 12000 });
+  const browser = await chromium.launch({ executablePath: browserExecutable(), headless: true, timeout: 12000,
+    // Containers often have a tiny /dev/shm, which crashes Chromium while rendering large pages.
+    ...(process.env.PAGEATLAS_HOSTED === '1' && { args: ['--disable-dev-shm-usage'] }),
+  });
   try {
     const context = await browser.newContext({ javaScriptEnabled: false, acceptDownloads: false });
     await context.route('**/*', route => route.abort());

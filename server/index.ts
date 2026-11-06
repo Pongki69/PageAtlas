@@ -4,21 +4,60 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { capturePage, CaptureError, isOnThisComputer, openCaptureSession } from './capture.ts';
+import { capturePage, CaptureError, crawlPageLimit, isOnThisComputer, openCaptureSession } from './capture.ts';
 import type { CaptureResult, CaptureRuntime, InteractiveCapture } from './capture.ts';
 import { renderReport } from './report.ts';
 import { renderCapturePdf } from './pdf-export.ts';
 import { resolveCaptureViewport } from '../shared/viewports.ts';
 const loopbackNames = new Set(['localhost', '127.0.0.1', '[::1]']);
 const dist = fileURLToPath(new URL('../dist/', import.meta.url));
-const port = Number(process.env.PAGEATLAS_PORT ?? 4317);
+/** Hosted mode serves many anonymous visitors from a public server instead of one person on their own computer. */
+const hosted = process.env.PAGEATLAS_HOSTED === '1';
+const port = Number(process.env.PAGEATLAS_PORT ?? (hosted ? process.env.PORT ?? 10000 : 4317));
 const dev = process.argv.includes('--dev');
 const maxBodyBytes = 8192;
 const reviewLifetime = 15 * 60 * 1000;
 const signedInReviewLifetime = 15 * 60 * 1000;
 const signInLifetime = 10 * 60 * 1000;
-const maxReviews = 1;
-const maxReviewImageBytes = 96 * 1024 * 1024;
+
+function wholeNumberSetting(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be a whole number between ${min} and ${max}.`);
+  }
+  return value;
+}
+
+function listSetting(name: string): string[] {
+  return (process.env[name] ?? '').split(',').map(value => value.trim()).filter(Boolean);
+}
+
+/** Captures that may run at the same time across all visitors; later captures wait in line. */
+const maxConcurrentCaptures = hosted ? wholeNumberSetting('PAGEATLAS_MAX_CONCURRENT', 1, 1, 16) : 1;
+const maxQueuedCaptures = hosted ? wholeNumberSetting('PAGEATLAS_MAX_QUEUE', 8, 0, 100) : 0;
+/** Captures one visitor, or one network address, may start per hour. */
+const hourlyCaptureLimit = hosted ? wholeNumberSetting('PAGEATLAS_HOURLY_LIMIT', 10, 1, 1000) : Infinity;
+const maxStoredReviews = hosted ? wholeNumberSetting('PAGEATLAS_MAX_REVIEWS', 12, 1, 500) : 1;
+const maxReviewImageBytes = wholeNumberSetting('PAGEATLAS_REVIEW_MEMORY_MB', 96, 8, 16384) * 1024 * 1024;
+/**
+ * Proxies in front of the server that append to X-Forwarded-For. When set, captures are also limited per network
+ * address. Leave it at 0 unless you have checked the header: a wrong count makes every visitor share one address.
+ */
+const proxyHops = hosted ? wholeNumberSetting('PAGEATLAS_PROXY_HOPS', 0, 0, 5) : 0;
+const allowedOrigins = new Set(listSetting('PAGEATLAS_ALLOWED_ORIGINS').map(origin => origin.replace(/\/$/, '')));
+const publicHosts = new Set([
+  ...listSetting('PAGEATLAS_PUBLIC_HOSTS'),
+  ...(process.env.RENDER_EXTERNAL_HOSTNAME ? [process.env.RENDER_EXTERNAL_HOSTNAME] : []),
+  ...[...allowedOrigins].map(origin => { try { return new URL(origin).host; } catch { return ''; } }).filter(Boolean),
+].map(host => host.toLowerCase()));
+for (const host of publicHosts) allowedOrigins.add(`https://${host}`);
+if (hosted && !publicHosts.size) {
+  throw new Error('Set PAGEATLAS_PUBLIC_HOSTS or PAGEATLAS_ALLOWED_ORIGINS to the public address of this PageAtlas server.');
+}
+const visitorCookie = 'pageatlas_visitor';
+const localOwner = 'local';
 const pngPrefix = 'data:image/png;base64,';
 const staticTypes: Readonly<Record<string, string>> = {
   '.css': 'text/css; charset=utf-8',
@@ -32,10 +71,14 @@ if (!Number.isInteger(port) || port < 1024 || port > 65535) {
 }
 
 const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
-const reviews = new Map<string, { capture: CaptureResult; expiresAt: number; imageBytes: number }>();
+const reviews = new Map<string, { owner: string; capture: CaptureResult; expiresAt: number; imageBytes: number }>();
 type SignIn = { id: string; browser: InteractiveCapture; expiresAt: number; timeout: NodeJS.Timeout; closing?: Promise<void> };
 let signIn: SignIn | undefined;
-let isCapturing = false;
+/** Visitors with a capture running, waiting in line, or a sign-in window opening. Each visitor runs one at a time. */
+const busyOwners = new Set<string>();
+let runningCaptures = 0;
+const captureLine: { job: CaptureJob; start: () => void }[] = [];
+const recentCaptures = new Map<string, number[]>();
 type CaptureInput = ReturnType<typeof parseCaptureInput>;
 type JobState = {
   id: string;
@@ -54,6 +97,7 @@ type JobState = {
   sessionId?: string;
 };
 type CaptureJob = {
+  owner: string;
   state: JobState;
   controller: AbortController;
   done: Promise<void>;
@@ -62,7 +106,90 @@ type CaptureJob = {
   nextLogId: number;
 };
 const jobs = new Map<string, CaptureJob>();
-let currentJob: CaptureJob | undefined;
+/** The latest capture of each visitor, restored when they refresh the page. */
+const currentJobs = new Map<string, CaptureJob>();
+
+function forgetCurrentJob(job: CaptureJob): void {
+  if (currentJobs.get(job.owner) === job) currentJobs.delete(job.owner);
+}
+
+/** Identifies the visitor so captures and reviews stay private to the browser that made them. */
+function cookieVisitor(req: IncomingMessage): string | undefined {
+  return new RegExp(`(?:^|;\\s*)${visitorCookie}=([0-9a-f-]{36})(?:;|$)`).exec(req.headers.cookie ?? '')?.[1];
+}
+
+function visitorOf(req: IncomingMessage, res: ServerResponse): string {
+  if (!hosted) return localOwner;
+  const existing = cookieVisitor(req);
+  if (existing) return existing;
+  const id = randomUUID();
+  res.setHeader('Set-Cookie', `${visitorCookie}=${id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`);
+  return id;
+}
+
+function clientAddress(req: IncomingMessage): string | undefined {
+  const forwarded = String(req.headers['x-forwarded-for'] ?? '').split(',').map(value => value.trim()).filter(Boolean);
+  // Proxies append the address they received the request from, so only the entries they added can be trusted.
+  return proxyHops && forwarded.length ? forwarded[Math.max(0, forwarded.length - proxyHops)] : undefined;
+}
+
+function requireCaptureAllowance(req: IncomingMessage, owner: string): void {
+  if (!hosted) return;
+  const hourAgo = Date.now() - 60 * 60 * 1000;
+  const address = clientAddress(req);
+  const keys = [`visitor:${owner}`, ...(address ? [`address:${address}`] : [])];
+  const histories = keys.map(key => (recentCaptures.get(key) ?? []).filter(time => time > hourAgo));
+  if (histories.some(history => history.length >= hourlyCaptureLimit)) {
+    throw new CaptureError(429, `You’ve reached the limit of ${hourlyCaptureLimit} captures per hour. Try again later, or run PageAtlas on your own computer for unlimited captures.`);
+  }
+  keys.forEach((key, index) => recentCaptures.set(key, [...histories[index]!, Date.now()]));
+}
+
+function updateLinePositions(): void {
+  captureLine.forEach(({ job }, index) => {
+    const phase = index === 0 ? 'Waiting for a free capture browser · next in line' : `Waiting for a free capture browser · ${index + 1} in line`;
+    if (job.state.phase !== phase) {
+      job.state.phase = phase;
+      job.state.updatedAt = new Date().toISOString();
+    }
+  });
+}
+
+/** Waits for a free capture browser. Rejects when the capture is stopped while waiting. */
+function acquireCaptureSlot(job: CaptureJob): Promise<void> {
+  if (runningCaptures < maxConcurrentCaptures) {
+    runningCaptures++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const signal = job.controller.signal;
+    const entry = {
+      job,
+      start: () => {
+        signal.removeEventListener('abort', leave);
+        runningCaptures++;
+        resolve();
+      },
+    };
+    function leave() {
+      const index = captureLine.indexOf(entry);
+      if (index >= 0) captureLine.splice(index, 1);
+      updateLinePositions();
+      reject(new CaptureError(499, 'Capture stopped.', 'CAPTURE_CANCELLED'));
+    }
+    signal.addEventListener('abort', leave, { once: true });
+    captureLine.push(entry);
+    logJob(job, 'All capture browsers are busy. Your capture will start automatically when one is free.');
+    updateLinePositions();
+  });
+}
+
+function releaseCaptureSlot(): void {
+  runningCaptures--;
+  const next = captureLine.shift();
+  updateLinePositions();
+  next?.start();
+}
 
 function sendJson(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -125,6 +252,12 @@ function parseCaptureInput(body: unknown) {
   if (loopbackNames.has(hostname) && Number(url.port) === port) {
     throw new CaptureError(400, 'Enter the address of the site or web app you want to review.');
   }
+  if (hosted && isOnThisComputer(hostname)) {
+    throw new CaptureError(400, 'The online version of PageAtlas captures public websites only. Run PageAtlas on your computer to capture a local app.');
+  }
+  if (hosted && allowDevCertificate) {
+    throw new CaptureError(400, 'Development certificates are available only when PageAtlas runs on your computer.');
+  }
   if (allowDevCertificate && (url.protocol !== 'https:' || !isOnThisComputer(hostname))) {
     throw new CaptureError(400, 'The development certificate option is available only for HTTPS apps running on this computer.');
   }
@@ -144,8 +277,13 @@ function deleteReview(id: string): void {
     job.state.logs = [];
     job.state.error = undefined;
     jobs.delete(jobId);
-    if (currentJob === job) currentJob = undefined;
+    forgetCurrentJob(job);
   }
+}
+
+function ownedReview(owner: string, id: string) {
+  const review = reviews.get(id);
+  return review?.owner === owner ? review : undefined;
 }
 
 function removeExpiredReviews(): void {
@@ -159,7 +297,8 @@ const expirationTimer = setInterval(pruneJobs, 30_000);
 expirationTimer.unref();
 
 function requireSameOrigin(req: IncomingMessage): void {
-  if ((req.headers.origin && req.headers.origin !== `http://${req.headers.host}`)
+  const origin = req.headers.origin;
+  if ((origin && (hosted ? !allowedOrigins.has(origin) : origin !== `http://${req.headers.host}`))
     || (req.headers['sec-fetch-site'] && !['same-origin', 'none'].includes(req.headers['sec-fetch-site']))) {
     throw new CaptureError(403, 'Start the capture from PageAtlas.');
   }
@@ -192,7 +331,7 @@ function reviewPageMetadata(capture: CaptureResult, id: string, reviewPath: stri
   };
 }
 
-function storeReview(capture: CaptureResult, lifetime = reviewLifetime) {
+function storeReview(owner: string, capture: CaptureResult, lifetime = reviewLifetime) {
   const id = randomUUID();
   const reviewPath = `/api/reviews/${id}`;
   const metadata = reviewPageMetadata(capture, id, reviewPath);
@@ -205,13 +344,18 @@ function storeReview(capture: CaptureResult, lifetime = reviewLifetime) {
     + page.scrollRegions.reduce((sum, region) => sum + region.screenshot.length, 0), 0,
   );
   removeExpiredReviews();
+  // Each visitor keeps only their latest review.
+  for (const [previous, review] of reviews) {
+    if (review.owner === owner) deleteReview(previous);
+  }
+  // When memory or the review count runs short, the oldest reviews of any visitor expire first.
   let retainedImageBytes = [...reviews.values()].reduce((total, review) => total + review.imageBytes, 0);
   for (const [oldest, review] of reviews) {
-    if (reviews.size < maxReviews && retainedImageBytes + imageBytes <= maxReviewImageBytes) break;
+    if (reviews.size < maxStoredReviews && retainedImageBytes + imageBytes <= maxReviewImageBytes) break;
     deleteReview(oldest);
     retainedImageBytes -= review.imageBytes;
   }
-  reviews.set(id, { capture, imageBytes, expiresAt: Date.now() + lifetime });
+  reviews.set(id, { owner, capture, imageBytes, expiresAt: Date.now() + lifetime });
   return { ...metadata, linkedPages };
 }
 
@@ -223,11 +367,17 @@ function closeSignIn(session: SignIn): Promise<void> {
   return session.closing;
 }
 
-function requireIdle(): void {
-  if (isCapturing) throw new CaptureError(429, 'A capture is already running. Try again in a moment.');
+function requireIdle(owner: string): void {
+  if (busyOwners.has(owner)) throw new CaptureError(429, 'A capture is already running. Try again in a moment.');
   if (!signIn) return;
   if (signIn.browser.isOpen()) throw new CaptureError(409, 'Finish or close the open sign-in window first.');
   void closeSignIn(signIn);
+}
+
+function requireLineSpace(): void {
+  if (runningCaptures >= maxConcurrentCaptures && captureLine.length >= maxQueuedCaptures) {
+    throw new CaptureError(503, 'PageAtlas is busy with other captures right now. Try again in a few minutes.');
+  }
 }
 
 function pruneJobs(): void {
@@ -236,8 +386,12 @@ function pruneJobs(): void {
     if (job.state.status === 'running' || job.state.status === 'cancelling') continue;
     if (job.expiresAt <= Date.now() || (job.state.result && !reviews.has(job.state.result.id))) {
       jobs.delete(id);
-      if (currentJob === job) currentJob = undefined;
+      forgetCurrentJob(job);
     }
+  }
+  const hourAgo = Date.now() - 60 * 60 * 1000;
+  for (const [key, times] of recentCaptures) {
+    if (!times.some(time => time > hourAgo)) recentCaptures.delete(key);
   }
 }
 
@@ -273,7 +427,7 @@ function updateJob(job: CaptureJob, event: Parameters<NonNullable<CaptureRuntime
 function captureSession(id: string): SignIn {
   const session = signIn?.id === id ? signIn : undefined;
   if (!session || session.closing) throw new CaptureError(410, 'This sign-in session ended. Open a new sign-in window.');
-  if (isCapturing) throw new CaptureError(429, 'A capture is already running. Follow its progress or stop it first.');
+  if (busyOwners.has(localOwner)) throw new CaptureError(429, 'A capture is already running. Follow its progress or stop it first.');
   if (session.expiresAt <= Date.now() || !session.browser.isOpen()) {
     void closeSignIn(session);
     throw new CaptureError(410, 'The sign-in window closed or expired. Open a new window to capture the page.');
@@ -281,18 +435,24 @@ function captureSession(id: string): SignIn {
   return session;
 }
 
-function beginJob(input: CaptureInput | undefined, session?: SignIn): CaptureJob {
-  if (isCapturing) throw new CaptureError(429, 'A capture is already running. Follow its progress or stop it first.');
+const maxRetainedJobs = Math.max(5, maxStoredReviews * 2 + maxConcurrentCaptures + maxQueuedCaptures);
+
+function beginJob(owner: string, input: CaptureInput | undefined, session?: SignIn): CaptureJob {
+  if (busyOwners.has(owner)) throw new CaptureError(429, 'A capture is already running. Follow its progress or stop it first.');
   if (!input && !session) throw new Error('A capture needs settings or a sign-in session.');
-  // Reserve the browser before starting any asynchronous work, including cleanup.
-  isCapturing = true;
+  // Reserve the visitor's capture before starting any asynchronous work, including cleanup.
+  busyOwners.add(owner);
   pruneJobs();
   for (const [id, old] of jobs) {
-    if (jobs.size < 5) break;
-    if (old.state.status !== 'running' && old.state.status !== 'cancelling') jobs.delete(id);
+    if (jobs.size < maxRetainedJobs) break;
+    if (old.state.status !== 'running' && old.state.status !== 'cancelling') {
+      jobs.delete(id);
+      forgetCurrentJob(old);
+    }
   }
   const now = new Date().toISOString();
   const job: CaptureJob = {
+    owner,
     state: {
       id: randomUUID(), status: 'running', progress: 1, phase: 'Starting capture',
       startedAt: now, updatedAt: now, logs: [], pagesCaptured: 0, viewsCaptured: 0,
@@ -300,14 +460,22 @@ function beginJob(input: CaptureInput | undefined, session?: SignIn): CaptureJob
     },
     controller: new AbortController(), done: Promise.resolve(), expiresAt: Infinity, nextLogId: 1,
   };
-  currentJob = job;
+  currentJobs.set(owner, job);
   jobs.set(job.state.id, job);
   logJob(job, 'Capture started. Progress will stay available if you refresh this page.');
   job.done = Promise.resolve().then(async () => {
     let keepSession = false;
     let capture: CaptureResult | undefined;
+    let holdsSlot = false;
     const runtime: CaptureRuntime = { signal: job.controller.signal, onProgress: event => updateJob(job, event) };
     try {
+      await acquireCaptureSlot(job);
+      holdsSlot = true;
+      if (job.controller.signal.aborted) throw new CaptureError(499, 'Capture stopped.', 'CAPTURE_CANCELLED');
+      if (job.state.phase !== 'Starting capture') {
+        job.state.phase = 'Starting capture';
+        logJob(job, 'A capture browser is free. Starting your capture.');
+      }
       capture = session ? await session.browser.capture(runtime) : await capturePage(input!, runtime);
       if (job.controller.signal.aborted) throw new CaptureError(499, 'Capture stopped.', 'CAPTURE_CANCELLED');
     } catch (error) {
@@ -338,7 +506,7 @@ function beginJob(input: CaptureInput | undefined, session?: SignIn): CaptureJob
       } else {
         if (capture && !job.state.error) {
           try {
-            job.state.result = storeReview(capture, session ? signedInReviewLifetime : reviewLifetime);
+            job.state.result = storeReview(owner, capture, session ? signedInReviewLifetime : reviewLifetime);
             job.state.pagesCaptured = 1 + (capture.linkedPages?.length ?? 0);
             job.state.viewsCaptured = [capture, ...(capture.linkedPages ?? [])]
               .reduce((total, page) => total + (page.viewportShots?.length ?? 1), 0);
@@ -355,33 +523,47 @@ function beginJob(input: CaptureInput | undefined, session?: SignIn): CaptureJob
       }
       job.state.updatedAt = new Date().toISOString();
       job.expiresAt = Date.now() + (session ? signedInReviewLifetime : reviewLifetime);
-      isCapturing = false;
+      if (holdsSlot) releaseCaptureSlot();
+      busyOwners.delete(owner);
     }
   });
   return job;
 }
 
-async function createJob(req: IncomingMessage, res: ServerResponse): Promise<void> {
+function requireLocalSignIn(): void {
+  if (hosted) throw new CaptureError(403, 'Sign-in capture is available only when PageAtlas runs on your computer.');
+}
+
+/** Checks that a visitor may start a new capture now, recording it against their hourly allowance. */
+function admitCapture(req: IncomingMessage, owner: string): void {
+  requireIdle(owner);
+  requireLineSpace();
+  requireCaptureAllowance(req, owner);
+}
+
+async function createJob(req: IncomingMessage, res: ServerResponse, owner: string): Promise<void> {
   requireSameOrigin(req);
   const body = await readJson(req);
   let job: CaptureJob;
   if (body && typeof body === 'object' && 'sessionId' in body) {
+    requireLocalSignIn();
     if (typeof body.sessionId !== 'string' || !/^[0-9a-f-]{36}$/.test(body.sessionId)) {
       throw new CaptureError(400, 'Open a sign-in window before capturing.');
     }
-    job = beginJob(undefined, captureSession(body.sessionId));
+    job = beginJob(owner, undefined, captureSession(body.sessionId));
   } else {
     const input = parseCaptureInput(body);
-    requireIdle();
-    job = beginJob(input);
+    admitCapture(req, owner);
+    job = beginJob(owner, input);
   }
   sendJson(res, 202, { job: job.state });
 }
 
-function serveJob(req: IncomingMessage, res: ServerResponse, id?: string, cancel = false): void {
+function serveJob(req: IncomingMessage, res: ServerResponse, owner: string, id?: string, cancel = false): void {
   requireSameOrigin(req);
   pruneJobs();
-  const job = id ? jobs.get(id) : currentJob;
+  const found = id ? jobs.get(id) : currentJobs.get(owner);
+  const job = found?.owner === owner ? found : undefined;
   if (id && !job) throw new CaptureError(404, 'This capture job has expired. Start a new capture.');
   if (job && cancel && job.state.status === 'running') {
     job.state.status = 'cancelling';
@@ -402,23 +584,24 @@ async function sendCompletedJob(res: ServerResponse, job: CaptureJob): Promise<v
   throw new CaptureError(job.errorStatus ?? 502, job.state.error ?? 'Capture stopped.', job.state.errorCode);
 }
 
-async function createReview(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function createReview(req: IncomingMessage, res: ServerResponse, owner: string): Promise<void> {
   requireSameOrigin(req);
   const input = await captureInput(req);
-  requireIdle();
-  await sendCompletedJob(res, beginJob(input));
+  admitCapture(req, owner);
+  await sendCompletedJob(res, beginJob(owner, input));
 }
 
 async function startSignIn(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  requireLocalSignIn();
   requireSameOrigin(req);
   const input = await captureInput(req);
   const url = new URL(input.url);
   if (url.protocol !== 'https:' && !loopbackNames.has(url.hostname.replace(/\.$/, ''))) {
     throw new CaptureError(400, 'Use an HTTPS address to sign in, or a localhost address for a local app.');
   }
-  requireIdle();
+  requireIdle(localOwner);
 
-  isCapturing = true;
+  busyOwners.add(localOwner);
   try {
     const browser = await openCaptureSession(input);
     if (res.destroyed) {
@@ -428,7 +611,7 @@ async function startSignIn(req: IncomingMessage, res: ServerResponse): Promise<v
     const id = randomUUID();
     const expiresAt = Date.now() + signInLifetime;
     const timeout = setTimeout(() => {
-      if (signIn?.id === id && !isCapturing) void closeSignIn(signIn);
+      if (signIn?.id === id && !busyOwners.has(localOwner)) void closeSignIn(signIn);
     }, signInLifetime);
     timeout.unref();
     signIn = { id, browser, expiresAt, timeout };
@@ -437,26 +620,27 @@ async function startSignIn(req: IncomingMessage, res: ServerResponse): Promise<v
     if (error instanceof CaptureError) throw error;
     throw new CaptureError(502, 'The sign-in window could not open. Try again.');
   } finally {
-    isCapturing = false;
+    busyOwners.delete(localOwner);
   }
 }
 
 async function finishSignIn(req: IncomingMessage, res: ServerResponse, id: string, cancel: boolean): Promise<void> {
+  requireLocalSignIn();
   requireSameOrigin(req);
   const session = signIn?.id === id ? signIn : undefined;
   if (!session || session.closing) throw new CaptureError(410, 'This sign-in session ended. Open a new sign-in window.');
-  if (isCapturing) throw new CaptureError(429, 'A capture is already running. Try again in a moment.');
+  if (busyOwners.has(localOwner)) throw new CaptureError(429, 'A capture is already running. Try again in a moment.');
   if (cancel) {
     await closeSignIn(session);
     res.writeHead(204).end();
     return;
   }
-  await sendCompletedJob(res, beginJob(undefined, captureSession(id)));
+  await sendCompletedJob(res, beginJob(localOwner, undefined, captureSession(id)));
 }
 
-async function serveReview(res: ServerResponse, id: string, action: string, regionId?: string, pageNumber?: string, shotId?: string): Promise<void> {
+async function serveReview(res: ServerResponse, owner: string, id: string, action: string, regionId?: string, pageNumber?: string, shotId?: string): Promise<void> {
   removeExpiredReviews();
-  const review = reviews.get(id)?.capture;
+  const review = ownedReview(owner, id)?.capture;
   if (!review) throw new CaptureError(404, 'This review has expired. Capture the page again.');
 
   if (action === 'export-pdf') {
@@ -508,38 +692,48 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
   res.setHeader('X-Frame-Options', 'DENY');
 
-  if (!req.headers.host || !hosts.has(req.headers.host)) {
-    throw new CaptureError(403, 'Open PageAtlas using its local address.');
-  }
   const pathname = req.url?.split('?')[0] ?? '';
+  // Hosting platforms probe this from inside their network, using an internal address as the host.
+  if (hosted && pathname === '/api/health' && (req.method === 'GET' || req.method === 'HEAD')) {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (hosted ? !publicHosts.has((req.headers.host ?? '').toLowerCase()) : !req.headers.host || !hosts.has(req.headers.host)) {
+    throw new CaptureError(403, hosted ? 'Open PageAtlas using its public address.' : 'Open PageAtlas using its local address.');
+  }
+  const owner = visitorOf(req, res);
   const deletePath = /^\/api\/reviews\/([0-9a-f-]{36})$/.exec(pathname);
   if (deletePath?.[1] && req.method === 'DELETE') {
     requireSameOrigin(req);
-    deleteReview(deletePath[1]);
+    if (ownedReview(owner, deletePath[1])) deleteReview(deletePath[1]);
     res.writeHead(204).end();
     return;
   }
   if (pathname === '/api/server-info' && req.method === 'GET') {
     requireSameOrigin(req);
-    sendJson(res, 200, {
-      app: 'PageAtlas', pid: process.pid, parentPid: process.ppid,
+    sendJson(res, 200, hosted ? {
+      app: 'PageAtlas', hosted: true, signIn: false, devCertificate: false,
+      crawlPageLimit: crawlPageLimit(), hourlyCaptureLimit, reviewMinutes: reviewLifetime / 60_000,
+    } : {
+      app: 'PageAtlas', hosted: false, signIn: true, devCertificate: true, crawlPageLimit: crawlPageLimit(),
+      pid: process.pid, parentPid: process.ppid,
       projectRoot: fileURLToPath(new URL('../', import.meta.url)),
     });
     return;
   }
   if (pathname === '/api/capture-job') {
-    if (req.method === 'GET') serveJob(req, res);
-    else if (req.method === 'POST') await createJob(req, res);
+    if (req.method === 'GET') serveJob(req, res, owner);
+    else if (req.method === 'POST') await createJob(req, res, owner);
     else throw new CaptureError(405, 'Method not allowed.');
     return;
   }
   const jobPath = /^\/api\/capture-job\/([0-9a-f-]{36})(\/cancel)?$/.exec(pathname);
   if (jobPath?.[1] && (jobPath[2] ? req.method === 'POST' : req.method === 'GET')) {
-    serveJob(req, res, jobPath[1], !!jobPath[2]);
+    serveJob(req, res, owner, jobPath[1], !!jobPath[2]);
     return;
   }
   if (pathname === '/api/capture' && req.method === 'POST') {
-    await createReview(req, res);
+    await createReview(req, res, owner);
     return;
   }
   if (pathname === '/api/sign-in' && req.method === 'POST') {
@@ -554,7 +748,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const reviewPath = /^\/api\/reviews\/([0-9a-f-]{36})(?:\/pages\/([1-9]\d?))?\/(screenshot|viewport|export|export-pdf|scroll-regions\/([a-z0-9-]{1,32})\/screenshot|shots\/(view-\d{1,2}))$/.exec(pathname);
   if ((req.method === 'GET' || (req.method === 'POST' && ['export', 'export-pdf'].includes(reviewPath?.[3] ?? ''))) && reviewPath?.[1] && reviewPath[3]) {
     requireSameOrigin(req);
-    await serveReview(res, reviewPath[1], reviewPath[3], reviewPath[4], reviewPath[2], reviewPath[5]);
+    await serveReview(res, owner, reviewPath[1], reviewPath[3], reviewPath[4], reviewPath[2], reviewPath[5]);
     return;
   }
   if (pathname.startsWith('/api/')) throw new CaptureError(404, 'This endpoint does not exist.');
@@ -591,9 +785,11 @@ const server = createServer({ requestTimeout: 15_000, headersTimeout: 10_000 }, 
       return;
     }
     if (error instanceof CaptureError) {
+      const owner = hosted ? cookieVisitor(req) : localOwner;
+      const current = owner ? currentJobs.get(owner) : undefined;
       sendJson(res, error.status, {
         error: error.message, code: error.code,
-        job: error.status === 429 && currentJob && ['running', 'cancelling'].includes(currentJob.state.status) ? currentJob.state : undefined,
+        job: error.status === 429 && current && ['running', 'cancelling'].includes(current.state.status) ? current.state : undefined,
       });
       return;
     }
@@ -611,4 +807,8 @@ server.on('error', (error: NodeJS.ErrnoException) => {
   process.exit(1);
 });
 
-server.listen(port, '127.0.0.1', () => console.log(`PageAtlas is ready at http://127.0.0.1:${port}`));
+if (hosted) {
+  server.listen(port, '0.0.0.0', () => console.log(`PageAtlas (hosted) is listening on port ${port} for ${[...publicHosts].join(', ')}`));
+} else {
+  server.listen(port, '127.0.0.1', () => console.log(`PageAtlas is ready at http://127.0.0.1:${port}`));
+}

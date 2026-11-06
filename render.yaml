@@ -1,0 +1,29 @@
+# Render Blueprint for the PageAtlas capture server on Render's free plan.
+# Free instances have about 512 MB of memory and sleep after 15 minutes without traffic,
+# so this runs one capture at a time and keeps linked-page crawls short.
+services:
+  - type: web
+    name: pageatlas
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # The address of your Vercel site, such as https://pageatlas.vercel.app. Separate several with commas.
+      - key: PAGEATLAS_ALLOWED_ORIGINS
+        sync: false
+      - key: PAGEATLAS_MAX_CONCURRENT
+        value: "1"
+      - key: PAGEATLAS_MAX_QUEUE
+        value: "6"
+      - key: PAGEATLAS_HOURLY_LIMIT
+        value: "10"
+      - key: PAGEATLAS_CRAWL_LIMIT
+        value: "8"
+      - key: PAGEATLAS_MAX_REVIEWS
+        value: "6"
+      - key: PAGEATLAS_REVIEW_MEMORY_MB
+        value: "48"
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=256"
