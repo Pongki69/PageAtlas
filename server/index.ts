@@ -31,7 +31,17 @@ function wholeNumberSetting(name: string, fallback: number, min: number, max: nu
 }
 
 function listSetting(name: string): string[] {
-  return (process.env[name] ?? '').split(',').map(value => value.trim()).filter(Boolean);
+  // Dashboards make it easy to paste quotes, spaces, or line breaks around values.
+  return (process.env[name] ?? '').split(/[,\s]+/).map(value => value.replace(/^["']+|["']+$/g, '').trim()).filter(Boolean);
+}
+
+/** Reduces an address such as "https://Example.app/" to the origin browsers send, "https://example.app". */
+function originOf(value: string): string {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return value.replace(/\/+$/, '').toLowerCase();
+  }
 }
 
 /** Captures that may run at the same time across all visitors; later captures wait in line. */
@@ -46,7 +56,7 @@ const maxReviewImageBytes = wholeNumberSetting('PAGEATLAS_REVIEW_MEMORY_MB', 96,
  * address. Leave it at 0 unless you have checked the header: a wrong count makes every visitor share one address.
  */
 const proxyHops = hosted ? wholeNumberSetting('PAGEATLAS_PROXY_HOPS', 0, 0, 5) : 0;
-const allowedOrigins = new Set(listSetting('PAGEATLAS_ALLOWED_ORIGINS').map(origin => origin.replace(/\/$/, '')));
+const allowedOrigins = new Set(listSetting('PAGEATLAS_ALLOWED_ORIGINS').map(originOf));
 const publicHosts = new Set([
   ...listSetting('PAGEATLAS_PUBLIC_HOSTS'),
   ...(process.env.RENDER_EXTERNAL_HOSTNAME ? [process.env.RENDER_EXTERNAL_HOSTNAME] : []),
@@ -813,7 +823,7 @@ server.on('error', (error: NodeJS.ErrnoException) => {
 });
 
 if (hosted) {
-  server.listen(port, '0.0.0.0', () => console.log(`PageAtlas (hosted) is listening on port ${port} for ${[...publicHosts].join(', ')}`));
+  server.listen(port, '0.0.0.0', () => console.log(`PageAtlas (hosted) is listening on port ${port}. Accepting captures from ${[...allowedOrigins].join(', ')}`));
 } else {
   server.listen(port, '127.0.0.1', () => console.log(`PageAtlas is ready at http://127.0.0.1:${port}`));
 }
