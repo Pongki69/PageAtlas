@@ -10,9 +10,10 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
-      # The address of your Vercel site, such as https://pageatlas.vercel.app. Separate several with commas.
+      # Sites that open PageAtlas and send captures to this server (not the pages being captured).
+      # Separate several addresses with commas.
       - key: PAGEATLAS_ALLOWED_ORIGINS
-        sync: false
+        value: https://page-atlas.vercel.app
       - key: PAGEATLAS_MAX_CONCURRENT
         value: "1"
       - key: PAGEATLAS_MAX_QUEUE

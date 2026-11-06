@@ -207,7 +207,7 @@ Visitors stay anonymous. A cookie keeps each visitor's captures private to their
 ### Deploy
 
 1. On Render, choose **New → Blueprint** and select this repository. Render reads [render.yaml](render.yaml) and builds the [Dockerfile](Dockerfile).
-2. When Render asks for `PAGEATLAS_ALLOWED_ORIGINS`, enter your Vercel address, such as `https://pageatlas.vercel.app`.
+2. Set `PAGEATLAS_ALLOWED_ORIGINS` in [render.yaml](render.yaml) to the address of your PageAtlas site on Vercel (currently `https://page-atlas.vercel.app`). It lists the sites allowed to send captures to the server. Any public page can still be captured.
 3. Check that the address in [vercel.json](vercel.json) matches your Render service (`https://pageatlas.onrender.com` by default), then redeploy on Vercel.
 
 > [!NOTE]
